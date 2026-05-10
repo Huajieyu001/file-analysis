@@ -104,7 +104,7 @@ class DupGroupModel(QAbstractTableModel):
     def __init__(self):
         super().__init__()
         self._groups = []  # [(hash, size, files_sorted), ...]
-        self._headers = ["大小", "数量", "浪费", "保留文件", ""]
+        self._headers = ["#", "大小", "数量", "浪费", "保留文件", ""]
 
     def rowCount(self, parent=QModelIndex()): return len(self._groups)
     def columnCount(self, parent=QModelIndex()): return 5
@@ -117,13 +117,15 @@ class DupGroupModel(QAbstractTableModel):
         keep_path = files[0][0]
 
         if role == Qt.DisplayRole:
-            if c == 0: return format_size(fsize)
-            if c == 1: return f"{len(files)}×"
-            if c == 2: return format_size(wasted)
-            if c == 3: return keep_path
-            if c == 4: return "展开 ▸"
+            if c == 0: return str(r + 1)          # 序号
+            if c == 1: return format_size(fsize)
+            if c == 2: return f"{len(files)}×"
+            if c == 3: return format_size(wasted)
+            if c == 4: return keep_path
+            if c == 5: return "展开 ▸"
         if role == Qt.ForegroundRole:
-            if c in (0, 4): return QColor("#8be9fd")
+            if c == 0: return QColor("#6272a4")   # 序号灰色
+            if c in (1, 5): return QColor("#8be9fd")  # 大小、展开蓝色
             return QColor("#c0c5d4")
         if role == Qt.UserRole:
             return (r, ghash, fsize, files)
@@ -483,12 +485,9 @@ class MainWindow(QMainWindow):
         detail_header = QHBoxLayout()
         detail_header.addWidget(QLabel("勾选 = 删除"))
         detail_header.addStretch()
-        self.detail_select_all = QPushButton("全选")
-        self.detail_select_all.clicked.connect(self._detail_sel_all)
-        detail_header.addWidget(self.detail_select_all)
-        self.detail_select_none = QPushButton("取消")
-        self.detail_select_none.clicked.connect(self._detail_sel_none)
-        detail_header.addWidget(self.detail_select_none)
+        self.detail_toggle_btn = QPushButton("全选")
+        self.detail_toggle_btn.clicked.connect(self._detail_toggle_all)
+        detail_header.addWidget(self.detail_toggle_btn)
         self.detail_delete_btn = QPushButton("🗑 删除勾选的文件")
         self.detail_delete_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold;")
         self.detail_delete_btn.clicked.connect(self._delete_checked)
@@ -505,6 +504,7 @@ class MainWindow(QMainWindow):
         self.detail_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.detail_table.customContextMenuRequested.connect(self._detail_context_menu)
         self.detail_model = FileDetailModel()
+        self.detail_model.dataChanged.connect(self._update_toggle_btn)
         self.detail_table.setModel(self.detail_model)
         self.detail_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         # Direct click handler for checkbox toggling (Qt model setData is unreliable for checkboxes)
@@ -698,6 +698,7 @@ class MainWindow(QMainWindow):
             ghash, fsize, files = self.dup_groups[row]
             self.detail_model.set_files(files)
             self.detail_widget.setVisible(True)
+            self._update_toggle_btn()
             self._current_dup_row = row
             self._current_dup_files = files
 
@@ -734,11 +735,17 @@ class MainWindow(QMainWindow):
                        lambda: [self._delete_one_file(p) for p in paths])
         menu.exec(QCursor.pos())
 
-    def _detail_sel_all(self):
-        self.detail_model.check_all()
+    def _detail_toggle_all(self):
+        all_checked = all(c for _, _, _, c in self.detail_model._files)
+        if all_checked:
+            self.detail_model.uncheck_all()
+        else:
+            self.detail_model.check_all()
+        self._update_toggle_btn()
 
-    def _detail_sel_none(self):
-        self.detail_model.uncheck_all()
+    def _update_toggle_btn(self):
+        all_checked = all(c for _, _, _, c in self.detail_model._files)
+        self.detail_toggle_btn.setText("取消全选" if all_checked else "全选")
 
     def _delete_checked(self):
         checked = self.detail_model.get_checked()
