@@ -1,2 +1,2 @@
 xxhash>=3.0.0
-customtkinter>=5.0.0
+PySide6>=6.5.0
