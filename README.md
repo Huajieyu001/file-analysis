@@ -48,48 +48,42 @@ file-analysis/
 └── settings.json       桌面客户端配置文件（后缀过滤）
 ```
 
-## 三种使用方式
+## 使用方式（三选一）
 
-### 1. 桌面客户端（推荐）
+三种入口完全独立，选一个即可。
+
+### 方式 A：桌面客户端（推荐）
 
 ```bash
 pip install customtkinter xxhash
 python app.py
 ```
 
+- 独立桌面应用，**不需要浏览器，不需要启动服务**
 - 启动即自动增量扫描
 - 类似 Everything 的即时搜索
-- 一键删除重复文件（保留最旧）
-- 设置弹窗勾选后缀过滤
+- 一键删除重复文件
 
-### 2. 命令行
+### 方式 B：命令行
 
 ```bash
 pip install xxhash
-
-# 全盘扫描
 python dedup.py scan --drives D E F G H
-
-# 增量扫描（默认）
-python dedup.py scan --drives D E F G H
-
-# 导出报告
 python dedup.py report -o dupes.csv
-
-# 交互式查看
-python dedup.py report --interactive
-
-# 统计
 python dedup.py stats
 ```
 
-### 3. Web 界面
+- 纯终端操作，适合脚本/定时任务
+
+### 方式 C：Web 界面（可选）
 
 ```bash
 pip install xxhash fastapi uvicorn
 python server.py
-# 浏览器打开 http://localhost:8899
 ```
+
+- 启动后浏览器打开 `http://localhost:8899`
+- 适合远程访问或不想装桌面依赖的场景
 
 ## 配置
 
