@@ -33,7 +33,8 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
     Pass 3: For same quick_hash groups, compute full_hash (skipped in fast_mode).
     """
     scan_start = time.time()
-    existing = db.existing_paths_map() if not force else {}
+    # Always load existing paths to detect deleted files
+    existing = db.existing_paths_map()
 
     # ---- Pass 1: Walk and record file sizes ----
     if progress_callback:
@@ -42,12 +43,13 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
     batch = []
     new_count = 0
     skipped_count = 0
-    missing_set = set(existing.keys()) if existing else set()
+    missing_set = set(existing.keys())
 
     for file_path, file_size, mtime_ns in walk_files(paths, extensions=extensions):
         missing_set.discard(file_path)
 
         prev = existing.get(file_path)
+        # force=False: skip unchanged files. force=True: re-hash everything
         if prev and not force:
             prev_size, prev_mtime, prev_status = prev
             if prev_size == file_size and prev_mtime == mtime_ns:

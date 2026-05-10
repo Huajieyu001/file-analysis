@@ -428,7 +428,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.incr_btn)
 
         self.refresh_btn = QPushButton("⟳ 全量刷新")
-        self.refresh_btn.clicked.connect(lambda: self._run_scan(True))
+        self.refresh_btn.clicked.connect(self._on_refresh_clicked)
         btn_row.addWidget(self.refresh_btn)
 
         btn_row.addStretch()
@@ -464,7 +464,7 @@ class MainWindow(QMainWindow):
         # Top: group list
         self.dup_table = QTableView()
         self.dup_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.dup_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.dup_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.dup_table.horizontalHeader().setStretchLastSection(True)
         self.dup_table.verticalHeader().setVisible(False)
         self.dup_table.setShowGrid(False)
@@ -497,6 +497,7 @@ class MainWindow(QMainWindow):
 
         self.detail_table = QTableView()
         self.detail_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.detail_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.detail_table.horizontalHeader().setStretchLastSection(True)
         self.detail_table.verticalHeader().setVisible(False)
         self.detail_table.setShowGrid(False)
@@ -506,6 +507,8 @@ class MainWindow(QMainWindow):
         self.detail_model = FileDetailModel()
         self.detail_table.setModel(self.detail_model)
         self.detail_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        # Direct click handler for checkbox toggling (Qt model setData is unreliable for checkboxes)
+        self.detail_table.clicked.connect(self._on_detail_checkbox_clicked)
         detail_layout.addWidget(self.detail_table)
 
         detail_widget.setVisible(False)
@@ -522,7 +525,7 @@ class MainWindow(QMainWindow):
 
         self.search_table = QTableView()
         self.search_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.search_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.search_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.search_table.horizontalHeader().setStretchLastSection(True)
         self.search_table.verticalHeader().setVisible(False)
         self.search_table.setShowGrid(False)
@@ -591,7 +594,26 @@ class MainWindow(QMainWindow):
     # ── Scan ─────────────────────────────────────────────────────────────
 
     def _start_auto_scan(self):
-        QTimer.singleShot(500, lambda: self._run_scan(False))
+        # Clean stale records then do a full rescan on every startup
+        QTimer.singleShot(300, self._clean_db_silent)
+        QTimer.singleShot(600, lambda: self._run_scan(True))
+
+    def _clean_db_silent(self):
+        """Clean missing files without confirmation dialog."""
+        try:
+            db = Database()
+            db.init_db()
+            n = db.remove_nonexistent()
+            db.close()
+            if n > 0:
+                self.sbar.showMessage(f"清理了 {n} 条失效记录")
+        except Exception:
+            pass
+
+    def _on_refresh_clicked(self):
+        reply = QMessageBox.question(self, "确认", "全量刷新将重新扫描所有文件。确定？")
+        if reply == QMessageBox.Yes:
+            self._run_scan(True)
 
     def _run_scan(self, force):
         if self.scan_running: return
@@ -599,10 +621,6 @@ class MainWindow(QMainWindow):
         if not drives:
             QTimer.singleShot(500, lambda: self._run_scan(force))
             return
-
-        if force:
-            reply = QMessageBox.question(self, "确认", "全量刷新将重新扫描所有文件。确定？")
-            if reply != QMessageBox.Yes: return
 
         self.scan_running = True
         self.status_lbl.setText("● 扫描中...")
@@ -688,19 +706,32 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self.dup_groups):
             _reveal_in_explorer(self.dup_groups[row][2][0][0])
 
+    def _on_detail_checkbox_clicked(self, index):
+        """Toggle checkbox for column 0 clicks."""
+        if index.column() != 0:
+            return
+        # Toggle the checked state
+        fp, fs, mt, checked = self.detail_model._files[index.row()]
+        new_state = not checked
+        self.detail_model._files[index.row()] = (fp, fs, mt, new_state)
+        self.detail_model.dataChanged.emit(index, index, [Qt.CheckStateRole])
+
     def _detail_context_menu(self, pos):
-        """Right-click menu for individual files in detail view."""
-        index = self.detail_table.indexAt(pos)
-        if not index.isValid(): return
-        fp = self.detail_model.data(index, Qt.UserRole)
-        if not fp: return
+        """Right-click menu for files in detail view (supports multi-select)."""
+        paths = self._get_selected_paths(self.detail_table, self.detail_model)
+        if not paths: return
+        count = len(paths)
+        label = f" ({count}个)" if count > 1 else ""
+
         menu = QMenu(self)
-        menu.addAction("📂 打开文件位置", lambda: _reveal_in_explorer(fp))
-        menu.addAction("📋 复制路径", lambda: (
-            QApplication.clipboard().setText(fp),
-            self.sbar.showMessage("路径已复制")))
+        menu.addAction(f"📂 打开文件位置{label}",
+                       lambda: [_reveal_in_explorer(p) for p in paths])
+        menu.addAction(f"📋 复制路径{label}",
+                       lambda: (QApplication.clipboard().setText("\n".join(paths)),
+                                self.sbar.showMessage(f"已复制 {count} 个路径")))
         menu.addSeparator()
-        menu.addAction("🗑 删除此文件", lambda: self._delete_one_file(fp))
+        menu.addAction(f"🗑 删除此文件{label}",
+                       lambda: [self._delete_one_file(p) for p in paths])
         menu.exec(QCursor.pos())
 
     def _detail_sel_all(self):
@@ -748,18 +779,30 @@ class MainWindow(QMainWindow):
         if fp: _reveal_in_explorer(fp)
 
     def _search_context_menu(self, pos):
-        index = self.search_table.indexAt(pos)
-        fp = self.search_model.get_row_path(index.row()) if index.isValid() else ""
-        if not fp: return
+        paths = self._get_selected_paths(self.search_table, self.search_model)
+        if not paths: return
+        count = len(paths)
+        label = f" ({count}个)" if count > 1 else ""
 
         menu = QMenu(self)
-        menu.addAction("📂 打开文件位置", lambda: _reveal_in_explorer(fp))
-        menu.addAction("📋 复制路径", lambda: (
-            QApplication.clipboard().setText(fp),
-            self.sbar.showMessage("路径已复制")))
+        menu.addAction(f"📂 打开文件位置{label}",
+                       lambda: [_reveal_in_explorer(p) for p in paths])
+        menu.addAction(f"📋 复制路径{label}",
+                       lambda: (QApplication.clipboard().setText("\n".join(paths)),
+                                self.sbar.showMessage(f"已复制 {count} 个路径")))
         menu.addSeparator()
-        menu.addAction("🗑 删除此文件", lambda: self._delete_one_file(fp))
+        menu.addAction(f"🗑 删除此文件{label}",
+                       lambda: [self._delete_one_file(p) for p in paths])
         menu.exec(QCursor.pos())
+
+    def _get_selected_paths(self, table, model):
+        """Get all selected file paths from a table (supports multi-select)."""
+        paths = []
+        for index in table.selectionModel().selectedRows():
+            if index.isValid():
+                fp = model.data(index, Qt.UserRole)
+                if fp: paths.append(fp)
+        return paths
 
     def _delete_one_file(self, fp):
         reply = QMessageBox.question(self, "确认删除", f"确定删除此文件？\n\n{fp}")
@@ -770,6 +813,30 @@ class MainWindow(QMainWindow):
             db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
             db.conn.commit(); db.close()
             self.sbar.showMessage(f"已删除: {os.path.basename(fp)}")
+
+            # Immediately update detail model — remove the deleted file
+            new_files = [(p, s, m, c) for p, s, m, c in self.detail_model._files if p != fp]
+            if len(new_files) <= 1:
+                # No longer a duplicate group — remove from dup list entirely
+                self.detail_widget.setVisible(False)
+                if hasattr(self, '_current_dup_row'):
+                    self.dup_groups.pop(self._current_dup_row)
+                self.dup_model.set_groups(self.dup_groups[:200])
+            else:
+                # Update the files in the current dup group
+                self.detail_model._files = new_files
+                self.detail_model.beginResetModel()
+                self.detail_model.endResetModel()
+                # Update dup_groups and dup_model
+                if hasattr(self, '_current_dup_row') and hasattr(self, '_current_dup_files'):
+                    old_files = self._current_dup_files
+                    remaining = [(p, s, m) for p, s, m in old_files if p != fp]
+                    if remaining:
+                        ghash, fsize, _ = self.dup_groups[self._current_dup_row]
+                        self.dup_groups[self._current_dup_row] = (ghash, fsize, remaining)
+                        self.dup_model.set_groups(self.dup_groups[:200])
+
+            # Background reload to sync stats
             self._load_data()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"删除失败: {e}")
