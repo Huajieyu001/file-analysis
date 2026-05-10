@@ -1,7 +1,17 @@
+"""
+SQLite 数据库封装
+-----------------
+- WAL 模式支持并发读，写入串行化
+- busy_timeout=30s 等待锁释放
+- 两阶段哈希流程：sized → quick_hashed → full_hashed
+- 增量扫描依赖 mtime_ns 判断文件是否变化
+"""
+
 import sqlite3
 import time
 from config import DB_PATH
 
+# 建表 DDL，索引覆盖核心查询路径：按大小、按 quick_hash+大小、按 full_hash、按状态
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -38,10 +48,12 @@ class Database:
     @property
     def conn(self):
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, timeout=self._timeout)
-            self._conn.execute("PRAGMA busy_timeout=30000")  # 30s wait before giving up
+            self._conn = sqlite3.connect(self.db_path, timeout=self._timeout,
+                                         isolation_level='IMMEDIATE')
+            self._conn.execute("PRAGMA busy_timeout=30000")  # 30s wait
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA wal_autocheckpoint=1000")
             self._conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
         return self._conn
 
@@ -55,6 +67,23 @@ class Database:
             self._conn = None
 
     # ---- File index operations ----
+
+    def search_files(self, keyword, limit=200):
+        """Search files by path/filename keyword. Returns list of (file_path, file_size, mtime_ns, full_hash, status, dup_count)."""
+        like = f"%{keyword}%"
+        rows = self.conn.execute(
+            """SELECT f.file_path, f.file_size, f.mtime_ns, f.full_hash, f.status,
+                      CASE WHEN f.full_hash IS NOT NULL THEN
+                        (SELECT COUNT(*) - 1 FROM file_index f2
+                         WHERE f2.full_hash = f.full_hash)
+                      ELSE 0 END
+               FROM file_index f
+               WHERE f.file_path LIKE ? AND f.status != 'missing'
+               ORDER BY f.file_size DESC
+               LIMIT ?""",
+            (like, limit),
+        ).fetchall()
+        return rows
 
     def get_file_record(self, file_path):
         """Return (id, file_path, file_size, mtime_ns, quick_hash, full_hash, scan_time, status) or None."""
@@ -116,6 +145,29 @@ class Database:
         self.conn.execute(
             "UPDATE file_index SET status='missing' WHERE status != 'missing'"
         )
+
+    def remove_nonexistent(self):
+        """Remove records where the file no longer exists on disk."""
+        import os
+        rows = self.conn.execute(
+            "SELECT id, file_path FROM file_index WHERE status != 'missing'"
+        ).fetchall()
+        gone_ids = []
+        for (rid, fp) in rows:
+            if not os.path.exists(fp):
+                gone_ids.append(rid)
+        if gone_ids:
+            now = int(time.time())
+            # Batch delete in chunks
+            for i in range(0, len(gone_ids), 500):
+                chunk = gone_ids[i:i+500]
+                placeholders = ",".join("?" * len(chunk))
+                self.conn.execute(
+                    f"DELETE FROM file_index WHERE id IN ({placeholders})",
+                    chunk,
+                )
+            self.conn.commit()
+        return len(gone_ids)
 
     def remove_missing(self):
         """Delete all records with status='missing'."""

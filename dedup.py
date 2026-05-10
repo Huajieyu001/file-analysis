@@ -1,29 +1,56 @@
 #!/usr/bin/env python3
 """
-File Deduplication Tool
+文件去重工具 — 命令行入口
+===========================
 
-Finds duplicate files across large storage systems using a multi-pass strategy:
-  1. Group by file size
-  2. Quick hash (head + tail bytes)
-  3. Full hash (XXH128)
-Results are persisted in SQLite for incremental rescans.
+三段式去重：按大小分组 → 快速哈希 → 完整哈希(可选)
+结果持久化到 SQLite，支持增量扫描。
 
-Usage:
+用法示例：
+  # 扫描指定盘符
+  python dedup.py scan --drives D E F
+
+  # 扫描指定目录
   python dedup.py scan --paths D:/Videos E:/Backup
-  python dedup.py report --format csv --output dupes.csv
+
+  # 增量扫描（自动跳过未变化文件，默认行为）
+  python dedup.py scan --drives D E F
+
+  # 强制全量重扫
+  python dedup.py scan --drives D E F --force
+
+  # 全量哈希精确模式（默认快速模式跳过低速的全文件哈希）
+  python dedup.py scan --drives D E F --full-hash
+
+  # 只扫描特定后缀
+  python dedup.py scan --drives D E F -e .mp4 .mkv
+
+  # 导出报告
+  python dedup.py report -o dupes.csv
+  python dedup.py report -o dupes.json
   python dedup.py report --interactive
+
+  # 查看统计 / 清理数据库
   python dedup.py stats
+  python dedup.py clean
 """
 
 import argparse
 import os
 import sys
+from datetime import datetime
 
-# Force UTF-8 on Windows to handle paths with non-GBK characters
+# Windows 终端可能使用 GBK 编码，强制 UTF-8 避免路径中的特殊字符报错
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from config import DB_PATH, SCAN_EXTENSIONS, MIN_FILE_SIZE_MB
+
+
+def _make_output_name(ext=".csv", label=""):
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    label = f"-{label}" if label else ""
+    return f"dupes{label}-{ts}{ext}"
 from database import Database
 from deduplicator import run_dedup
 from reporter import (
@@ -103,7 +130,8 @@ def cmd_scan(args):
             print(f"  {msg}")
 
     duplicate_groups = run_dedup(
-        paths, db, force=args.force, progress_callback=progress, extensions=extensions
+        paths, db, force=args.force, progress_callback=progress, extensions=extensions,
+        fast_mode=not args.full_hash,
     )
 
     print_summary(duplicate_groups)
@@ -112,13 +140,14 @@ def cmd_scan(args):
         if args.interactive:
             interactive_mode(duplicate_groups)
         elif args.output:
-            ext = os.path.splitext(args.output)[1].lower()
+            out_path = _make_output_name() if args.output == "__auto__" else args.output
+            ext = os.path.splitext(out_path)[1].lower()
             if ext == ".csv":
-                export_csv(duplicate_groups, args.output)
-                print(f"\nReport exported to {args.output} (CSV)")
+                export_csv(duplicate_groups, out_path)
+                print(f"\nReport exported to {out_path} (CSV)")
             elif ext == ".json":
-                export_json(duplicate_groups, args.output)
-                print(f"\nReport exported to {args.output} (JSON)")
+                export_json(duplicate_groups, out_path)
+                print(f"\nReport exported to {out_path} (JSON)")
             else:
                 print(f"Unknown format: {ext}. Use .csv or .json")
         else:
@@ -143,13 +172,14 @@ def cmd_report(args):
     if args.interactive:
         interactive_mode(duplicate_groups)
     elif args.output:
-        ext = os.path.splitext(args.output)[1].lower()
+        out_path = _make_output_name() if args.output == "__auto__" else args.output
+        ext = os.path.splitext(out_path)[1].lower()
         if ext == ".csv":
-            count = export_csv(duplicate_groups, args.output)
-            print(f"Exported {count} groups to {args.output}")
+            count = export_csv(duplicate_groups, out_path)
+            print(f"Exported {count} groups to {out_path}")
         elif ext == ".json":
-            count = export_json(duplicate_groups, args.output)
-            print(f"Exported {count} groups to {args.output}")
+            count = export_json(duplicate_groups, out_path)
+            print(f"Exported {count} groups to {out_path}")
         else:
             print(f"Unknown format: {ext}. Use .csv or .json")
     else:
@@ -179,9 +209,8 @@ def cmd_clean(args):
             print("No database found.")
     else:
         db.init_db()
-        db.mark_all_missing()
-        db.remove_missing()
-        print("Cleaned up missing file records from database.")
+        removed = db.remove_nonexistent()
+        print(f"Cleaned up {removed} missing file records from database.")
 
     db.close()
 
@@ -199,7 +228,11 @@ def main():
     scan_p.add_argument("--paths", nargs="+", help="Directories or files to scan")
     scan_p.add_argument("--drives", nargs="+", help="Drive letters to scan (e.g. D E F)")
     scan_p.add_argument("--force", action="store_true", help="Force re-hash all files")
-    scan_p.add_argument("--output", "-o", help="Export report to file (.csv or .json)")
+    scan_p.add_argument("--full-hash", action="store_true",
+                        help="Compute full file hash (slow, accurate). Default: quick hash only.")
+    scan_p.add_argument("--output", "-o", nargs="?", const="__auto__",
+                        help="Export report (.csv/.json). Without value, auto-generates "
+                             "timestamped filename: dupes-YYYYMMDD-HHmmss.csv")
     scan_p.add_argument("--interactive", "-i", action="store_true",
                         help="Interactive mode after scan")
     scan_p.add_argument("--extensions", "-e", nargs="+",
@@ -209,7 +242,9 @@ def main():
     # report
     report_p = sub.add_parser("report", help="Generate report from existing database")
     report_p.add_argument("--format", choices=["csv", "json"], default="csv")
-    report_p.add_argument("--output", "-o", help="Output file path")
+    report_p.add_argument("--output", "-o", nargs="?", const="__auto__",
+                          help="Output file path (.csv/.json). Without value, auto-generates "
+                               "timestamped filename: dupes-YYYYMMDD-HHmmss.csv")
     report_p.add_argument("--interactive", "-i", action="store_true",
                           help="Interactive duplicate review")
 

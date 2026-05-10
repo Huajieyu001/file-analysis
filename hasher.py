@@ -1,3 +1,12 @@
+"""
+哈希计算模块
+-----------
+两级哈希策略：
+  quick_hash — 只读文件首尾各 64KB，速度快，用于快速排除不同内容文件
+  full_hash  — 流式读取完整文件，精确但慢，仅对 quick_hash 碰撞的候选文件执行
+使用 XXH128 算法，速度极快(>10GB/s)，128位碰撞概率极低。
+"""
+
 import os
 import xxhash
 from config import QUICK_HASH_HEAD_BYTES, QUICK_HASH_TAIL_BYTES, HASH_READ_CHUNK
@@ -8,6 +17,8 @@ def quick_hash(filepath):
 
     Returns bytes (16 bytes for XXH128), or None if file can't be read.
     """
+    if not os.path.exists(filepath):
+        return None
     try:
         file_size = os.path.getsize(filepath)
     except OSError:
@@ -38,6 +49,8 @@ def full_hash(filepath):
 
     Returns bytes (16 bytes), or None if file can't be read.
     """
+    if not os.path.exists(filepath):
+        return None
     h = xxhash.xxh128()
     try:
         with open(filepath, "rb") as f:

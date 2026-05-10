@@ -1,9 +1,12 @@
 # Output files
-dupes.csv
-dupes.json
+dupes*.csv
+dupes*.json
 dedup.db
 dedup.db-wal
 dedup.db-shm
+
+# Local config
+settings.json
 
 # Python
 __pycache__/

@@ -1,14 +1,23 @@
+"""
+结果输出模块
+-----------
+支持三种输出方式：
+  - CSV 导出，可在 Excel 中打开
+  - JSON 导出，供其他工具处理
+  - 终端交互式模式，逐组手工决定保留/删除
+"""
+
 import csv
 import json
 import os
 import sys
 from datetime import datetime
 
-# Force UTF-8 on Windows to handle paths with non-GBK characters
+# Windows 终端可能使用 GBK 编码，强制 UTF-8 避免路径中的特殊字符报错
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# Multiplier for human-readable size
+# 可读大小单位
 _SIZE_UNITS = ["B", "KB", "MB", "GB", "TB"]
 
 

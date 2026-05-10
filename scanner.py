@@ -1,3 +1,10 @@
+"""
+文件遍历模块
+-----------
+递归遍历指定目录，生成器模式逐文件 yield，不一次性加载到内存。
+自动跳过系统目录和无关文件扩展名，支持后缀白名单过滤。
+"""
+
 import os
 from config import SKIP_DIRS, SKIP_EXTENSIONS, MIN_FILE_SIZE, SCAN_EXTENSIONS
 

@@ -1,17 +1,28 @@
+"""
+全局配置常量
+-----------
+所有可调参数集中在此文件，CLI / Web / 桌面客户端均读取此配置。
+"""
+
 import os
 
-# Database
+# ---- 数据库 ----
+# SQLite 数据库文件路径，默认存放在项目根目录
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dedup.db")
 
-# Hashing
-QUICK_HASH_HEAD_BYTES = 64 * 1024   # 64KB from file head
-QUICK_HASH_TAIL_BYTES = 64 * 1024   # 64KB from file tail
-HASH_READ_CHUNK = 1024 * 1024       # 1MB chunks for full_hash streaming
+# ---- 哈希计算 ----
+# 快速哈希：仅读取文件头尾各 64KB，用于快速排除不同内容的同大小文件
+QUICK_HASH_HEAD_BYTES = 64 * 1024   # 文件头读取量
+QUICK_HASH_TAIL_BYTES = 64 * 1024   # 文件尾读取量
+# 完整哈希：流式读取时的缓冲区大小
+HASH_READ_CHUNK = 1024 * 1024       # 1MB 块
 
-# Concurrency
+# ---- 并发 ----
+# I/O 密集型任务（读文件算哈希）的并行线程数
 WORKER_THREADS = 4
 
-# Directories to skip
+# ---- 目录过滤 ----
+# 遍历文件时自动跳过这些目录（系统/临时目录）
 SKIP_DIRS = {
     "$RECYCLE.BIN",
     "System Volume Information",
@@ -25,12 +36,15 @@ SKIP_DIRS = {
     "node_modules",
 }
 
-# File size limit in MB. Files smaller than this are skipped.
-# 0 = no limit. Example: 10 = skip files under 10 MB.
-MIN_FILE_SIZE_MB = 0
-MIN_FILE_SIZE = MIN_FILE_SIZE_MB * 1024 * 1024
+# ---- 文件大小过滤 ----
+# 小于此值的文件直接跳过（单位 MB，0 = 不限制）
+# 视频去重场景建议 100-200MB 以上
+MIN_FILE_SIZE_MB = 200
+MIN_FILE_SIZE = MIN_FILE_SIZE_MB * 1024 * 1024  # 内部使用的字节值
 
-# Only scan files with these extensions. Empty = scan all.
+# ---- 文件后缀过滤 ----
+# 仅扫描这些后缀的文件，留空 set() 则扫描所有类型
+# CLI/桌面客户端可通过 --extensions 参数覆盖
 SCAN_EXTENSIONS = {
     # --- 主流容器 ---
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
@@ -57,6 +71,6 @@ SCAN_EXTENSIONS = {
     ".m4p", ".m4b", ".cpi", ".clpi",
 }
 
-
-# System files always skipped regardless of SCAN_EXTENSIONS
+# ---- 系统文件 ----
+# 无论后缀过滤如何配置，始终跳过的文件扩展名
 SKIP_EXTENSIONS = {".DS_Store", ".Thumbs.db", ".thumb", ".ini"}

@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文件去重工具</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font:14px/1.5 system-ui,-apple-system,sans-serif;background:#0f0f13;color:#c9d1d9;min-height:100vh}
+.container{max-width:960px;margin:0 auto;padding:20px}
+h1{font-size:20px;color:#58a6ff;margin-bottom:20px;display:flex;align-items:center;gap:8px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:16px;margin-bottom:16px}
+.card-title{font-size:14px;font-weight:600;color:#e6edf3;margin-bottom:12px}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.form-group{display:flex;flex-direction:column;gap:4px}
+.form-group label{font-size:12px;color:#8b949e}
+input,select,button{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;padding:6px 10px;border-radius:4px;font-size:13px}
+input:focus,select:focus{outline:0;border-color:#58a6ff}
+button{cursor:pointer;border:0;font-weight:500;display:flex;align-items:center;gap:6px}
+.btn-primary{background:#238636;color:#fff}
+.btn-primary:hover{background:#2ea043}
+.btn-danger{background:#da3633;color:#fff}
+.btn-danger:hover{background:#f85149}
+.btn-outline{background:transparent;border:1px solid #30363d}
+.btn-outline:hover{background:#21262d}
+.btn-sm{font-size:12px;padding:4px 8px}
+/* Drives */
+.drive-list{display:flex;flex-wrap:wrap;gap:6px}
+.drive-chip{display:flex;align-items:center;gap:6px;padding:5px 10px;background:#0d1117;border:1px solid #30363d;border-radius:4px;cursor:pointer;font-size:13px;user-select:none}
+.drive-chip:hover{border-color:#58a6ff}
+.drive-chip.selected{background:#1f6feb22;border-color:#1f6feb;color:#58a6ff}
+.drive-chip input{display:none}
+/* Progress */
+.progress-bar{width:100%;height:6px;background:#21262d;border-radius:3px;margin-top:8px;overflow:hidden}
+.progress-fill{height:100%;background:#238636;border-radius:3px;transition:width .3s}
+.progress-done{background:#58a6ff}
+#progress-text{font-size:12px;color:#8b949e;margin-top:6px}
+/* Table */
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:8px 10px;font-size:13px;border-bottom:1px solid #21262d}
+th{color:#8b949e;font-weight:500;position:sticky;top:0;background:#161b22}
+tr:hover{background:#1c2128}
+.file-list{list-style:none;font-size:12px;color:#8b949e;margin-top:4px}
+.file-list li{padding:2px 0}
+.file-list .keep{color:#7ee787}
+.file-list .dup{color:#f85149}
+.badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px}
+.badge-dup{background:#da363333;color:#f85149}
+.badge-save{background:#23863633;color:#7ee787}
+.toast{position:fixed;bottom:20px;right:20px;padding:10px 16px;border-radius:4px;font-size:13px;z-index:99}
+.toast-ok{background:#238636;color:#fff}
+.toast-err{background:#da3633;color:#fff}
+.hidden{display:none}
+.mono{font-family:ui-monospace,monospace;font-size:12px}
+.summary{display:flex;gap:16px;flex-wrap:wrap}
+.summary-item{flex:1;min-width:120px;background:#0d1117;border:1px solid #30363d;border-radius:4px;padding:12px;text-align:center}
+.summary-item .num{font-size:24px;font-weight:700;color:#58a6ff}
+.summary-item .lbl{font-size:11px;color:#8b949e;margin-top:4px}
+/* Search */
+.search-item{display:flex;align-items:center;gap:12px;padding:8px 10px;border-bottom:1px solid #21262d;font-size:13px}
+.search-item:hover{background:#1c2128}
+.search-item .path{flex:1;word-break:break-all;color:#c9d1d9;font-family:ui-monospace,monospace;font-size:12px}
+.search-item .path .hl{color:#58a6ff;background:#1f6feb22;border-radius:2px;padding:0 2px}
+.search-item .meta{white-space:nowrap;font-size:12px;color:#8b949e}
+.badge-hasdup{background:#da363333;color:#f85149;padding:1px 6px;border-radius:3px;font-size:11px;white-space:nowrap}
+.badge-nodup{color:#484f58;font-size:11px;white-space:nowrap}
+#search-count{margin-left:8px}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>&#x1F50D; 文件去重工具</h1>
+
+<!-- Search card -->
+<div class="card">
+<div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+  <span>快速搜索</span>
+  <span id="search-stats" style="font-size:12px;color:#8b949e;font-weight:400"></span>
+</div>
+<div class="row" style="margin-bottom:12px">
+  <input type="text" id="search-input" placeholder="输入文件名或路径关键词搜索..." style="flex:1;min-width:300px"
+    oninput="doSearch()" autofocus>
+  <span style="font-size:12px;color:#8b949e" id="search-count"></span>
+</div>
+<div id="search-results" style="max-height:50vh;overflow-y:auto"></div>
+</div>
+
+<!-- Config card -->
+<div class="card">
+<div class="card-title">扫描配置</div>
+
+<div class="form-group" style="margin-bottom:12px">
+<label>选择盘符</label>
+<div class="drive-list" id="drive-list"><span style="color:#8b949e">加载中...</span></div>
+</div>
+
+<div class="row">
+<div class="form-group">
+<label>文件后缀</label>
+<input type="text" id="ext-input" style="width:320px" placeholder=".mp4 .mkv .avi ... 留空=默认全部视频格式">
+</div>
+<div class="form-group">
+<label>最小文件大小 (MB)</label>
+<input type="number" id="min-size" value="200" min="0" step="10" style="width:100px">
+</div>
+</div>
+
+<div class="row" style="margin-top:12px">
+<button class="btn-primary" id="btn-start" onclick="startScan()">&#9654; 开始扫描</button>
+<button class="btn-danger hidden" id="btn-stop" onclick="stopScan()">&#9632; 停止</button>
+<button class="btn-outline btn-sm" onclick="resetDb()">清理数据库</button>
+</div>
+
+<div id="progress-area" class="hidden" style="margin-top:12px">
+<div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+<div id="progress-text"></div>
+</div>
+</div>
+
+<!-- Summary card -->
+<div class="card hidden" id="summary-card">
+<div class="card-title">扫描结果</div>
+<div class="summary" id="summary"></div>
+</div>
+
+<!-- Results card -->
+<div class="card hidden" id="results-card">
+<div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+<span id="results-title">重复文件组</span>
+<div>
+<button class="btn-outline btn-sm" onclick="exportReport('csv')">导出 CSV</button>
+<button class="btn-outline btn-sm" onclick="exportReport('json')">导出 JSON</button>
+<button class="btn-outline btn-sm" onclick="loadMore()">加载更多</button>
+</div>
+</div>
+<div style="max-height:70vh;overflow-y:auto">
+<table><thead><tr><th>大小</th><th>重复数</th><th>浪费空间</th><th>文件列表</th><th style="width:80px">操作</th></tr></thead>
+<tbody id="results-tbody"></tbody></table>
+</div>
+</div>
+</div>
+
+<script>
+let state = {selectedDrives: new Set(), extensions: ''};
+
+// ---- Search ----
+let searchTimer = null;
+function doSearch() {
+  clearTimeout(searchTimer);
+  const q = document.getElementById('search-input').value.trim();
+  if (!q) {
+    document.getElementById('search-results').innerHTML = '';
+    document.getElementById('search-count').textContent = '';
+    document.getElementById('search-stats').textContent = '';
+    return;
+  }
+  if (q.length < 2) {
+    document.getElementById('search-results').innerHTML = '<div style="padding:12px;color:#8b949e">至少输入2个字符...</div>';
+    document.getElementById('search-count').textContent = '';
+    return;
+  }
+  searchTimer = setTimeout(() => {
+    fetch(`/api/search?q=${encodeURIComponent(q)}&limit=100`)
+      .then(r => r.json())
+      .then(d => {
+        if (!d.ok) { toast(d.error, 'err'); return; }
+        document.getElementById('search-count').textContent = `找到 ${d.count} 个`;
+        document.getElementById('search-stats').textContent =
+          `共 ${d.files.filter(f=>f.duplicates>0).length} 个文件有重复`;
+        renderSearchResults(d.files, q);
+      });
+  }, 200);
+}
+
+function renderSearchResults(files, q) {
+  const el = document.getElementById('search-results');
+  if (!files.length) {
+    el.innerHTML = '<div style="padding:12px;color:#8b949e">未找到匹配文件</div>';
+    return;
+  }
+  const rx = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`, 'gi');
+  el.innerHTML = files.map(f => `
+    <div class="search-item">
+      <div class="path">${f.path.replace(rx, '<span class="hl">$1</span>')}</div>
+      <span class="meta">${f.size_human}</span>
+      ${f.duplicates > 0
+        ? `<span class="badge-hasdup">&#9888; ${f.duplicates}个重复</span>`
+        : `<span class="badge-nodup">唯一</span>`}
+      <button class="btn-sm btn-danger" style="font-size:10px;padding:1px 6px"
+        onclick="deleteFile('${f.path.replace(/'/g, "\\'")}', this)">&#10005;</button>
+    </div>
+  `).join('');
+}
+
+// ---- Init ----
+fetch('/api/drives').then(r=>r.json()).then(d=>{
+  const el = document.getElementById('drive-list');
+  el.innerHTML = d.drives.map(dr=>`
+    <label class="drive-chip ${dr.letter === 'C' ? '' : 'selected'}" data-drive="${dr.letter}">
+      <input type="checkbox" value="${dr.letter}" ${dr.letter === 'C' ? '' : 'checked'} onchange="toggleDrive(this)">
+      ${dr.letter}:
+    </label>
+  `).join('');
+  d.drives.forEach(dr => {if(dr.letter !== 'C') state.selectedDrives.add(dr.letter);});
+});
+
+function toggleDrive(cb) {
+  if (cb.checked) state.selectedDrives.add(cb.value);
+  else state.selectedDrives.delete(cb.value);
+  cb.closest('.drive-chip').classList.toggle('selected', cb.checked);
+}
+
+let eventSource = null;
+function startScan() {
+  const drives = [...state.selectedDrives].map(d => d + ':\\');
+  if (!drives.length) return toast('请选择至少一个盘符', 'err');
+
+  const extRaw = document.getElementById('ext-input').value.trim();
+  const exts = extRaw ? extRaw.split(/\s+/) : [];
+  const minSize = parseInt(document.getElementById('min-size').value) || 0;
+
+  document.getElementById('btn-start').classList.add('hidden');
+  document.getElementById('btn-stop').classList.remove('hidden');
+  document.getElementById('progress-area').classList.remove('hidden');
+  document.getElementById('progress-fill').style.width = '2%';
+  document.getElementById('progress-fill').classList.remove('progress-done');
+  document.getElementById('progress-text').textContent = '准备中...';
+  document.getElementById('summary-card').classList.add('hidden');
+  document.getElementById('results-card').classList.add('hidden');
+
+  fetch('/api/scan/start', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({paths: drives, force: false, extensions: exts, min_size_mb: minSize})
+  }).then(r=>r.json()).then(d=>{
+    if (!d.ok) { toast(d.error, 'err'); resetBtns(); return; }
+  });
+
+  // SSE
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource('/api/scan/progress');
+  eventSource.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'progress') {
+      const txt = document.getElementById('progress-text');
+      const bar = document.getElementById('progress-fill');
+      txt.textContent = msg.message;
+      if (msg.stage === 'pass1_done') bar.style.width = '33%';
+      else if (msg.stage === 'pass2_done') bar.style.width = '66%';
+      else if (msg.stage.includes('progress')) {
+        if (msg.stage.startsWith('pass2')) bar.style.width = (33 + parseInt(msg.message.match(/(\d+)\/(\d+)/)?.[1] || 0) / parseInt(msg.message.match(/\/(\d+)/)?.[1] || 1) * 33) + '%';
+        else if (msg.stage.startsWith('pass3')) bar.style.width = (66 + parseInt(msg.message.match(/(\d+)\/(\d+)/)?.[1] || 0) / parseInt(msg.message.match(/\/(\d+)/)?.[1] || 1) * 34) + '%';
+      }
+    } else if (msg.type === 'done') {
+      document.getElementById('progress-fill').style.width = '100%';
+      document.getElementById('progress-fill').classList.add('progress-done');
+      document.getElementById('progress-text').textContent =
+        `完成！共 ${msg.total_files} 个文件，发现 ${msg.duplicate_groups} 组重复，浪费 ${msg.total_wasted}`;
+      resetBtns();
+      eventSource.close();
+      updateSummary(msg);
+      renderGroups(msg.top_groups);
+    } else if (msg.type === 'error') {
+      toast('错误: ' + msg.message, 'err');
+      resetBtns();
+    } else if (msg.type === 'stopped') {
+      document.getElementById('progress-text').textContent = '已停止';
+      resetBtns();
+    }
+  };
+}
+
+function stopScan() {
+  fetch('/api/scan/stop', {method:'POST'});
+}
+
+function resetBtns() {
+  document.getElementById('btn-start').classList.remove('hidden');
+  document.getElementById('btn-stop').classList.add('hidden');
+}
+
+function updateSummary(msg) {
+  document.getElementById('summary-card').classList.remove('hidden');
+  document.getElementById('summary').innerHTML = `
+    <div class="summary-item"><div class="num">${msg.total_files}</div><div class="lbl">文件总数</div></div>
+    <div class="summary-item"><div class="num">${msg.duplicate_groups}</div><div class="lbl">重复组</div></div>
+    <div class="summary-item"><div class="num" style="color:#f85149">${msg.total_wasted}</div><div class="lbl">浪费空间</div></div>
+  `;
+}
+
+function renderGroups(groups) {
+  document.getElementById('results-card').classList.remove('hidden');
+  document.getElementById('results-title').textContent = `重复文件组 (显示前${groups.length}组)`;
+  const tbody = document.getElementById('results-tbody');
+  tbody.innerHTML = groups.map((g,i) => `
+    <tr>
+      <td class="mono">${g.size_human}</td>
+      <td><span class="badge badge-dup">${g.count}x</span></td>
+      <td><span class="badge badge-save">${g.wasted}</span></td>
+      <td>
+        <ul class="file-list">
+        ${g.files.map((f,fi) => `
+          <li class="${fi===0?'keep':'dup'}" style="display:flex;align-items:center;gap:8px">
+            <span style="flex:1">${fi===0?'&#9733; ':''}${f.path.substring(0,100)}${f.path.length>100?'...':''}</span>
+            <button class="btn-sm btn-danger" style="font-size:10px;padding:1px 5px"
+              onclick="deleteFile('${f.path.replace(/'/g, "\\'")}', this)">&#10005;</button>
+          </li>
+        `).join('')}
+        </ul>
+      </td>
+      <td>
+        <button class="btn-sm btn-danger" style="font-size:11px;white-space:nowrap"
+          onclick="deleteDupGroup('${g.hash}', '${g.files.map(f=>f.path.replace(/'/g, "\\'")).join("||")}', this)"
+          title="保留第1个(最旧)，删除其余${g.count-1}个">删除 ${g.count-1}个重复</button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+let dupOffset = 0;
+function loadMore() {
+  dupOffset += 500;
+  fetch(`/api/duplicates?offset=${dupOffset}&limit=500`).then(r=>r.json()).then(d=>{
+    if (d.ok && d.groups.length) {
+      renderGroups(d.groups);
+      document.getElementById('results-title').textContent = `重复文件组 (${dupOffset+1}-${dupOffset+d.groups.length} / ${d.total})`;
+    }
+  });
+}
+
+async function exportReport(fmt) {
+  const r = await fetch('/api/export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({format: fmt})});
+  const d = await r.json();
+  if (d.ok) toast(`导出成功: ${d.filename}`, 'ok');
+  else toast('导出失败', 'err');
+}
+
+async function resetDb() {
+  if (!confirm('确定要清理数据库吗？(会清除缺失文件的记录)')) return;
+  const r = await fetch('/api/clean', {method:'POST'});
+  const d = await r.json();
+  if (d.ok) toast('数据库已清理', 'ok');
+}
+
+// ---- Delete ----
+async function deleteFile(fp, btn) {
+  if (!confirm(`确认删除此文件？\n${fp}`)) return;
+  btn.disabled = true;
+  btn.textContent = '...';
+  const r = await fetch('/api/files', {method:'DELETE', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path: fp})});
+  const d = await r.json();
+  if (d.ok) {
+    btn.closest('tr')?.remove();
+    btn.closest('.search-item')?.remove();
+    toast('已删除', 'ok');
+  } else {
+    toast('删除失败: ' + (d.error || ''), 'err');
+    btn.disabled = false;
+    btn.textContent = '✕';
+  }
+}
+
+async function deleteDupGroup(hash, pathsStr, btn) {
+  const paths = pathsStr.split('||');
+  if (!confirm(`将保留 1 个文件 (最旧)，删除其余 ${paths.length - 1} 个文件。\n\n保留: ${paths[0].substring(0, 100)}\n\n确认删除？`)) return;
+  btn.disabled = true;
+  btn.textContent = '删除中...';
+  const r = await fetch('/api/duplicates/delete-group', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({hash: hash, keep: 'oldest', paths: paths})
+  });
+  const d = await r.json();
+  if (d.ok) {
+    btn.closest('tr')?.remove();
+    toast(`已删除 ${d.deleted.length} 个文件，保留 1 个`, 'ok');
+  } else {
+    toast('删除失败: ' + (d.error || ''), 'err');
+    btn.disabled = false;
+    btn.textContent = `删除 ${paths.length - 1}个重复`;
+  }
+}
+
+function toast(msg, type) {
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+</script>
+</body>
+</html>

@@ -1,3 +1,18 @@
+"""
+去重核心编排
+-----------
+三段式逐步求精策略，逐层过滤缩小候选集：
+
+  Pass 1 — 按文件大小分组，大小唯一的文件直接排除(覆盖绝大多数)
+  Pass 2 — 同大小文件计算 quick_hash(首尾各64KB)，quick_hash 唯一的排除
+  Pass 3 — 同 quick_hash 文件计算 full_hash(完整文件)，确认最终重复
+
+快速模式(fast_mode=True)跳过 Pass 3，直接用 quick_hash 判定重复，
+牺牲极小精度换取数量级的扫描速度提升。
+
+所有哈希计算使用 ThreadPoolExecutor 并行执行，I/O 密集型任务收益显著。
+"""
+
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6,16 +21,16 @@ from scanner import walk_files
 from hasher import quick_hash, full_hash
 from config import WORKER_THREADS
 
-# How many records to commit in one batch for Pass 1
+# Pass 1 批量写入 DB 的记录数
 PASS1_BATCH = 2000
 
 
-def run_dedup(paths, db, force=False, progress_callback=None, extensions=None):
+def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, fast_mode=False):
     """Main dedup orchestration.
 
     Pass 1: Walk files, record size/mtime. Skip unchanged files (unless force=True).
     Pass 2: For same-size groups, compute quick_hash in parallel.
-    Pass 3: For same quick_hash groups, compute full_hash in parallel.
+    Pass 3: For same quick_hash groups, compute full_hash (skipped in fast_mode).
     """
     scan_start = time.time()
     existing = db.existing_paths_map() if not force else {}
@@ -82,6 +97,7 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None):
             description="quick hash",
             progress_callback=progress_callback,
             pass_label="pass2",
+            progress_interval=500,
         )
         db.conn.commit()
 
@@ -100,27 +116,44 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None):
             f"{len(qhash_groups)} groups need full hash",
         )
 
-    # ---- Pass 3: Full hash for same (quick_hash, size) groups ----
-    if progress_callback:
-        progress_callback("pass3_start", "Computing full hashes...")
-
-    full_queue = []
-    for quick_hash_val, file_size, _ in qhash_groups:
-        files = db.get_files_by_qhash_and_size(quick_hash_val, file_size)
-        full_queue.extend(files)
-
-    if full_queue:
-        _parallel_hash(
-            full_queue,
-            db,
-            hash_func=full_hash,
-            update_func=db.update_full_hash,
-            skip_func=db.update_skipped,
-            description="full hash",
-            progress_callback=progress_callback,
-            pass_label="pass3",
-        )
+    # ---- Pass 3: Full hash (skipped in fast_mode) ----
+    if fast_mode:
+        # Use quick_hash as final hash: same (qhash, size) => duplicate
+        if progress_callback:
+            progress_callback("pass3_start", "Fast mode: using quick hash as final, skipping full hash...")
+        now = int(time.time())
+        for qh, fsz, _ in qhash_groups:
+            db.conn.execute(
+                "UPDATE file_index SET full_hash=?, status='full_hashed', scan_time=? "
+                "WHERE quick_hash=? AND file_size=?",
+                (qh, now, qh, fsz),
+            )
         db.conn.commit()
+        if progress_callback:
+            progress_callback("pass3_done",
+                f"Fast mode: {len(qhash_groups)} duplicate groups confirmed via quick hash")
+    else:
+        if progress_callback:
+            progress_callback("pass3_start", "Computing full hashes...")
+
+        full_queue = []
+        for quick_hash_val, file_size, _ in qhash_groups:
+            files = db.get_files_by_qhash_and_size(quick_hash_val, file_size)
+            full_queue.extend(files)
+
+        if full_queue:
+            _parallel_hash(
+                full_queue,
+                db,
+                hash_func=full_hash,
+                update_func=db.update_full_hash,
+                skip_func=db.update_skipped,
+                description="full hash",
+                progress_callback=progress_callback,
+                pass_label="pass3",
+                progress_interval=50,
+            )
+            db.conn.commit()
 
     elapsed = time.time() - scan_start
     if progress_callback:
@@ -149,6 +182,7 @@ def _parallel_hash(
     description,
     progress_callback=None,
     pass_label="",
+    progress_interval=500,
 ):
     """Process a list of files with a hash function in parallel."""
     total = len(file_list)
@@ -172,7 +206,7 @@ def _parallel_hash(
             except Exception:
                 skip_func(file_path)
 
-            if done % 500 == 0 and progress_callback:
+            if done % progress_interval == 0 and progress_callback:
                 progress_callback(
                     f"{pass_label}_progress",
                     f"{description}: {done}/{total}",
