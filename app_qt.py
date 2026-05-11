@@ -113,14 +113,15 @@ class SearchTableModel(QAbstractTableModel):
 
 
 class DupGroupModel(QAbstractTableModel):
-    """Model for duplicate groups."""
+    """Model for duplicate groups with batch selection support."""
     def __init__(self):
         super().__init__()
-        self._groups = []  # [(hash, size, files_sorted), ...]
-        self._headers = ["#", "大小", "数量", "浪费", "保留文件", ""]
+        self._groups = []      # [(hash, size, files_sorted), ...]
+        self._checked = set()  # Set of checked row indices
+        self._headers = ["", "#", "大小", "数量", "浪费", "保留文件"]
 
     def rowCount(self, parent=QModelIndex()): return len(self._groups)
-    def columnCount(self, parent=QModelIndex()): return 5
+    def columnCount(self, parent=QModelIndex()): return 6
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid(): return None
@@ -129,16 +130,18 @@ class DupGroupModel(QAbstractTableModel):
         wasted = (len(files) - 1) * fsize
         keep_path = files[0][0]
 
+        if role == Qt.CheckStateRole and c == 0:
+            return Qt.Checked if r in self._checked else Qt.Unchecked
         if role == Qt.DisplayRole:
-            if c == 0: return str(r + 1)          # 序号
-            if c == 1: return format_size(fsize)
-            if c == 2: return f"{len(files)}×"
-            if c == 3: return format_size(wasted)
-            if c == 4: return keep_path
-            if c == 5: return "展开 ▸"
+            if c == 0: return ""
+            if c == 1: return str(r + 1)
+            if c == 2: return format_size(fsize)
+            if c == 3: return f"{len(files)}×"
+            if c == 4: return format_size(wasted)
+            if c == 5: return keep_path
         if role == Qt.ForegroundRole:
-            if c == 0: return QColor("#6272a4")   # 序号灰色
-            if c in (1, 5): return QColor("#8be9fd")  # 大小、展开蓝色
+            if c == 2: return QColor("#8be9fd")
+            if c == 1: return QColor("#6272a4")
             return QColor("#c0c5d4")
         if role == Qt.UserRole:
             return (r, ghash, fsize, files)
@@ -149,10 +152,44 @@ class DupGroupModel(QAbstractTableModel):
             return self._headers[section]
         return None
 
+    def flags(self, index):
+        if index.column() == 0:
+            return Qt.ItemIsUserCheckable | Qt.ItemIsEnabled
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+
+    def setData(self, index, value, role=Qt.CheckStateRole):
+        if index.column() == 0:
+            r = index.row()
+            if value == Qt.Checked:
+                self._checked.add(r)
+            else:
+                self._checked.discard(r)
+            self.dataChanged.emit(index, index, [role])
+            return True
+        return False
+
     def set_groups(self, groups):
         self.beginResetModel()
         self._groups = groups
+        self._checked.clear()
         self.endResetModel()
+
+    def check_all(self):
+        self._checked = set(range(len(self._groups)))
+        self.beginResetModel(); self.endResetModel()
+
+    def uncheck_all(self):
+        self._checked.clear()
+        self.beginResetModel(); self.endResetModel()
+
+    def has_any_checked(self):
+        return len(self._checked) > 0
+
+    def get_checked_groups(self):
+        return [self._groups[r] for r in sorted(self._checked)]
+
+    def get_checked_count(self):
+        return len(self._checked)
 
 
 class FileDetailModel(QAbstractTableModel):
@@ -474,19 +511,37 @@ class MainWindow(QMainWindow):
         dup_layout = QVBoxLayout(dup_widget)
         dup_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Batch action bar
+        batch_bar = QHBoxLayout()
+        self.batch_toggle_btn = QPushButton("全选")
+        self.batch_toggle_btn.clicked.connect(self._batch_toggle)
+        batch_bar.addWidget(self.batch_toggle_btn)
+        self.batch_delete_btn = QPushButton("🗑 批量清理勾选的组")
+        self.batch_delete_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold; padding: 4px 12px;")
+        self.batch_delete_btn.clicked.connect(self._batch_delete)
+        self.batch_delete_btn.setEnabled(False)
+        batch_bar.addWidget(self.batch_delete_btn)
+        batch_bar.addStretch()
+        self.batch_info_lbl = QLabel("")
+        self.batch_info_lbl.setStyleSheet("color: #6272a4;")
+        batch_bar.addWidget(self.batch_info_lbl)
+        dup_layout.addLayout(batch_bar)
+
         splitter = QSplitter(Qt.Vertical)
 
         # Top: group list
         self.dup_table = QTableView()
         self.dup_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.dup_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.dup_table.setDragEnabled(True)
+        self.dup_table.setDragDropMode(QAbstractItemView.NoDragDrop)
         self.dup_table.horizontalHeader().setStretchLastSection(True)
         self.dup_table.verticalHeader().setVisible(False)
         self.dup_table.setShowGrid(False)
         self.dup_table.setAlternatingRowColors(True)
-        self.dup_table.clicked.connect(self._on_dup_clicked)
-        self.dup_table.doubleClicked.connect(self._reveal_dup_file)
+        self.dup_table.clicked.connect(self._on_dup_table_clicked)
         self.dup_model = DupGroupModel()
+        self.dup_model.dataChanged.connect(self._update_batch_ui)
         self.dup_table.setModel(self.dup_model)
         splitter.addWidget(self.dup_table)
 
@@ -558,6 +613,40 @@ class MainWindow(QMainWindow):
         self.sbar = QStatusBar()
         self.sbar.setStyleSheet("color: #5a6478;")
         self.setStatusBar(self.sbar)
+        # Drive capacity widget on the right side of status bar
+        self.drive_capacity_lbl = QLabel("")
+        self.drive_capacity_lbl.setStyleSheet("color: #8be9fd; padding-right: 8px;")
+        self.sbar.addPermanentWidget(self.drive_capacity_lbl)
+        # Keyboard navigation for dup table
+        self.dup_table.selectionModel().currentChanged.connect(self._on_dup_current_changed)
+        # Update drive capacity on startup, when drives toggled, and every 30s
+        self._update_drive_capacity()
+        for cb in self.drive_checks.values():
+            cb.toggled.connect(self._update_drive_capacity)
+        self._cap_timer = QTimer()
+        self._cap_timer.timeout.connect(self._update_drive_capacity)
+        self._cap_timer.start(30000)  # 30s
+
+    # ── Drive capacity ───────────────────────────────────────────────────
+
+    def _update_drive_capacity(self):
+        """Show total/free space for selected drives (system call, no scan)."""
+        import shutil
+        drives = [f"{d}:\\" for d, cb in self.drive_checks.items() if cb.isChecked()]
+        total_all = 0
+        free_all = 0
+        for drive in drives:
+            try:
+                usage = shutil.disk_usage(drive)
+                total_all += usage.total
+                free_all += usage.free
+            except OSError:
+                pass
+        if total_all > 0:
+            self.drive_capacity_lbl.setText(
+                f"已选 {len(drives)} 盘  |  总容量 {format_size(total_all, prec=4)}  |  可用 {format_size(free_all, prec=4)}")
+        else:
+            self.drive_capacity_lbl.setText("")
 
     # ── Data loading ─────────────────────────────────────────────────────
 
@@ -674,6 +763,7 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self.dup_groups = dup_list
         self.dup_model.set_groups(dup_list[:200])
+        self._update_drive_capacity()
         self._load_data()
 
     @Slot(str)
@@ -707,7 +797,86 @@ class MainWindow(QMainWindow):
     # ── Dup group interaction ────────────────────────────────────────────
 
     @Slot(QModelIndex)
-    def _on_dup_clicked(self, index):
+    # ── Batch operations ─────────────────────────────────────────────────
+
+    def _batch_toggle(self):
+        if self.dup_model.has_any_checked():
+            self.dup_model.uncheck_all()
+        else:
+            self.dup_model.check_all()
+        self._update_batch_ui()
+
+    def _update_batch_ui(self):
+        n = self.dup_model.get_checked_count()
+        all_checked = n == len(self.dup_model._groups) and n > 0
+        self.batch_toggle_btn.setText("取消全选" if all_checked else "全选")
+        self.batch_delete_btn.setEnabled(n > 0)
+        if n > 0:
+            total_wasted = sum(
+                (len(g[2]) - 1) * g[1] for g in self.dup_model.get_checked_groups()
+            )
+            total_files = sum(len(g[2]) - 1 for g in self.dup_model.get_checked_groups())
+            self.batch_info_lbl.setText(f"已选 {n} 组  |  可删除 {total_files} 个文件  |  释放 {format_size(total_wasted)}")
+        else:
+            self.batch_info_lbl.setText("")
+
+    def _batch_delete(self):
+        groups = self.dup_model.get_checked_groups()
+        if not groups: return
+        total_files = sum(len(g[2]) - 1 for g in groups)
+        total_wasted = sum((len(g[2]) - 1) * g[1] for g in groups)
+
+        reply = QMessageBox.question(self, "批量清理确认",
+            f"将处理 {len(groups)} 组重复\n"
+            f"每组保留 1 个文件（最旧），共删除 {total_files} 个文件\n"
+            f"预计释放 {format_size(total_wasted)}\n\n确定？")
+        if reply != QMessageBox.Yes: return
+
+        deleted = 0
+        errors = 0
+        for ghash, fsize, files in groups:
+            files_sorted = sorted(files, key=lambda x: x[2])  # oldest first
+            for fp, fs, mt in files_sorted[1:]:  # delete all except first
+                try:
+                    if os.path.exists(fp): os.remove(fp)
+                    db = Database()
+                    db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
+                    db.conn.commit(); db.close()
+                    deleted += 1
+                except Exception:
+                    errors += 1
+
+        saved = format_size(total_wasted) if errors == 0 else "部分"
+        self.sbar.showMessage(f"批量清理完成: 删除 {deleted} 个文件，释放约 {saved}")
+        self._load_data()
+        self.detail_widget.setVisible(False)
+
+    def _on_dup_current_changed(self, current, previous):
+        """Keyboard navigation: update detail panel when selection moves."""
+        if not current.isValid(): return
+        row = current.row()
+        if 0 <= row < len(self.dup_groups):
+            ghash, fsize, files = self.dup_groups[row]
+            self.detail_model.set_files(files)
+            self.detail_widget.setVisible(True)
+            self._update_toggle_btn()
+            self._current_dup_row = row
+            self._current_dup_files = files
+
+    def _on_dup_table_clicked(self, index):
+        """Handle clicks: column 0 = toggle checkbox, others = expand group."""
+        if index.column() == 0:
+            # Toggle checkbox directly (Qt setData unreliable for this)
+            r = index.row()
+            if r in self.dup_model._checked:
+                self.dup_model._checked.discard(r)
+            else:
+                self.dup_model._checked.add(r)
+            self.dup_model.dataChanged.emit(index, index, [Qt.CheckStateRole])
+            self._update_batch_ui()
+            return
+
+        # Expand group detail
         row = index.row()
         if 0 <= row < len(self.dup_groups):
             ghash, fsize, files = self.dup_groups[row]
@@ -734,6 +903,9 @@ class MainWindow(QMainWindow):
 
     def _detail_context_menu(self, pos):
         """Right-click menu for files in detail view (supports multi-select)."""
+        index = self.detail_table.indexAt(pos)
+        if index.isValid() and not self.detail_table.selectionModel().selectedRows():
+            self.detail_table.selectRow(index.row())
         paths = self._get_selected_paths(self.detail_table, self.detail_model)
         if not paths: return
         count = len(paths)
@@ -801,6 +973,10 @@ class MainWindow(QMainWindow):
         if fp: _reveal_in_explorer(fp)
 
     def _search_context_menu(self, pos):
+        # Auto-select the row under cursor if nothing selected
+        index = self.search_table.indexAt(pos)
+        if index.isValid() and not self.search_table.selectionModel().selectedRows():
+            self.search_table.selectRow(index.row())
         paths = self._get_selected_paths(self.search_table, self.search_model)
         if not paths: return
         count = len(paths)
@@ -835,6 +1011,7 @@ class MainWindow(QMainWindow):
             db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
             db.conn.commit(); db.close()
             self.sbar.showMessage(f"已删除: {os.path.basename(fp)}")
+            self._update_drive_capacity()
 
             # Immediately update detail model — remove the deleted file
             new_files = [(p, s, m, c) for p, s, m, c in self.detail_model._files if p != fp]
@@ -938,7 +1115,8 @@ class MainWindow(QMainWindow):
 def _reveal_in_explorer(path):
     if os.path.exists(path):
         if sys.platform == "win32":
-            os.system(f'explorer /select,"{path}"')
+            import subprocess
+            subprocess.Popen(['explorer', '/select,', path])
 
 
 if __name__ == "__main__":

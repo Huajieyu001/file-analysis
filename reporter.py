@@ -21,7 +21,7 @@ if sys.platform == "win32" and sys.stdout is not None:
 _SIZE_UNITS = ["B", "KB", "MB", "GB", "TB"]
 
 
-def format_size(size_bytes):
+def format_size(size_bytes, prec=2):
     if size_bytes == 0:
         return "0 B"
     i = 0
@@ -29,7 +29,7 @@ def format_size(size_bytes):
     while fsize >= 1024 and i < len(_SIZE_UNITS) - 1:
         fsize /= 1024
         i += 1
-    return f"{fsize:.2f} {_SIZE_UNITS[i]}"
+    return f"{fsize:.{prec}f} {_SIZE_UNITS[i]}"
 
 
 def format_time(mtime_ns):
