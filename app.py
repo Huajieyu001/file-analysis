@@ -64,6 +64,11 @@ class App(ctk.CTk):
         self.geometry("1120x740")
         self.minsize(950, 550)
 
+        # Set custom icon
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+        if os.path.exists(icon_path):
+            self.iconbitmap(icon_path)
+
         self.scan_running = False
         self.scan_force = False
         self.db = Database()
@@ -512,18 +517,251 @@ class App(ctk.CTk):
     def _render_dups(self, groups):
         outer, rows_frame, cols, widths = self.dup_outer, self.dup_rows, self.dup_cols, self.dup_widths
         self._clear_rows(rows_frame)
+        self._expanded_rows = {}
         for i, (fhash, fsize, files) in enumerate(groups):
-            wasted = (len(files) - 1) * fsize
-            keep = files[0][0]
-            short = keep if len(keep) < 100 else "..." + keep[-97:]
-            row = self._add_row(rows_frame, cols, widths,
-                [format_size(fsize), f"{len(files)}×", format_size(wasted),
-                 short, "删除"],
-                {"_paths": "||".join(f[0] for f in files),
-                 "_hash": fhash.hex() if fhash else ""},
-                i)
+            files_sorted = sorted(files, key=lambda x: x[2])
+            wasted = (len(files_sorted) - 1) * fsize
+            short = files_sorted[0][0]
+            short = short if len(short) < 100 else "..." + short[-97:]
+            # Use selectable Entry for path so user can copy text
+            self._add_dup_row(rows_frame, cols, widths, i,
+                fhash, fsize, files_sorted, wasted, short)
         if groups:
             self.tab.set("重复组")
+
+    def _add_dup_row(self, parent, cols, widths, idx, fhash, fsize, files, wasted, short_path):
+        bg = "#1a1d29" if idx % 2 == 0 else "#1e2233"
+        # Use tk.Frame — CTkFrame doesn't propagate mouse events to child widgets
+        row = tk.Frame(parent, bg=bg, height=36, bd=0, highlightthickness=0)
+        row.pack(fill="x", pady=1, padx=2)
+        row.bind("<Enter>", lambda e, r=row: r.configure(bg="#252a3d"))
+        row.bind("<Leave>", lambda e, r=row: r.configure(bg=bg))
+
+        vals = [format_size(fsize), f"{len(files)}×", format_size(wasted), short_path, "展开 ▸"]
+        colors = ["#8be9fd", "#c0c5d4", "#c0c5d4", "#c0c5d4", "#8be9fd"]
+
+        for j, (val, w, c) in enumerate(zip(vals, widths, colors)):
+            if j == 3:  # path column — use selectable Entry
+                ent = tk.Entry(row, font=("Segoe UI", 11), fg="#c0c5d4", bg=bg,
+                               bd=0, readonlybackground=bg, highlightthickness=0,
+                               relief="flat", insertbackground="#8be9fd",
+                               selectbackground="#3a4055", selectforeground="#fff")
+                ent.insert(0, val)
+                ent.configure(state="readonly", width=int(w / 8))
+                ent.pack(side="left", padx=4)
+                ent.bind("<Enter>", lambda e, r=row: r.configure(bg="#252a3d"))
+                ent.bind("<Leave>", lambda e, r=row: r.configure(bg=bg))
+            elif j == 4:  # action column
+                lbl = ctk.CTkLabel(row, text=val, font=ctk.CTkFont(size=11), text_color=c,
+                                   width=w, anchor="center")
+                lbl.pack(side="left", padx=4)
+            else:
+                lbl = ctk.CTkLabel(row, text=val, font=ctk.CTkFont(size=12), text_color=c,
+                                   width=w, anchor="w" if w > 100 else "center")
+                lbl.pack(side="left", padx=4)
+
+        # Store data on the row frame
+        setattr(row, "_paths", "||".join(f[0] for f in files))
+        setattr(row, "_hash", fhash.hex() if fhash else "")
+        setattr(row, "_expanded", False)
+        setattr(row, "_files", files)
+        setattr(row, "_parent_frame", parent)
+        # Toggle expand on any click anywhere on the row
+        row.bind("<Button-1>", lambda e, r=row: self._toggle_expand(r, parent))
+        row.bind("<Button-3>", lambda e, r=row: self._on_dup_right_click(e, r))
+        # Also bind to all children so clicks don't get swallowed
+        for child in row.winfo_children():
+            child.bind("<Button-1>", lambda e, r=row: self._toggle_expand(r, parent), add="+")
+            child.bind("<Button-3>", lambda e, r=row: self._on_dup_right_click(e, r), add="+")
+        return row
+
+    def _toggle_expand(self, row, rows_frame):
+        expanded = getattr(row, "_expanded", False)
+        row_id = str(id(row))
+
+        if row_id in self._expanded_rows:
+            for w in self._expanded_rows[row_id]:
+                w.destroy()
+            del self._expanded_rows[row_id]
+
+        # Update action column (last tk.Label child)
+        for child in row.winfo_children():
+            try:
+                txt = child.cget("text")
+                if txt in ("展开 ▸", "收起 ▾"):
+                    child.configure(text="展开 ▸" if expanded else "收起 ▾")
+            except Exception:
+                pass
+
+        if expanded:
+            setattr(row, "_expanded", False)
+            return
+
+        setattr(row, "_expanded", True)
+        files = getattr(row, "_files", [])
+        if not files:
+            return
+
+        sub_widgets = []
+        # Delete-checkbox vars: default = all checked except first (oldest)
+        del_vars = {}
+        for fi, (fp, fs, mt) in enumerate(files):
+            var = tk.BooleanVar(value=(fi != 0))  # keep oldest unchecked, check rest
+            del_vars[fp] = var
+        setattr(row, "_del_vars", del_vars)
+
+        # Header
+        sub_hdr = ctk.CTkFrame(rows_frame, fg_color="#11131c", corner_radius=0, height=26)
+        sub_hdr.pack(fill="x", padx=20, pady=(2, 0))
+        ctk.CTkLabel(sub_hdr, text="  勾选=删除", font=ctk.CTkFont(size=10),
+                     text_color="#ff5555", width=80).pack(side="left")
+        ctk.CTkLabel(sub_hdr, text="文件路径（可选中复制）", font=ctk.CTkFont(size=10),
+                     text_color="#6272a4", anchor="w").pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(sub_hdr, text="大小", font=ctk.CTkFont(size=10),
+                     text_color="#6272a4", width=70).pack(side="right", padx=4)
+        ctk.CTkLabel(sub_hdr, text="修改时间", font=ctk.CTkFont(size=10),
+                     text_color="#6272a4", width=130).pack(side="right")
+        sub_widgets.append(sub_hdr)
+
+        for fi, (fp, fs, mt) in enumerate(files):
+            bg = "#1a1d29" if fi % 2 == 0 else "#1e2233"
+            fr = ctk.CTkFrame(rows_frame, fg_color=bg, corner_radius=0, height=30)
+            fr.pack(fill="x", padx=20, pady=1)
+            fr.bind("<Enter>", lambda e, f=fr: f.configure(fg_color="#252a3d"))
+            fr.bind("<Leave>", lambda e, f=fr, b=bg: f.configure(fg_color=bg))
+
+            cb = ctk.CTkCheckBox(fr, text="", variable=del_vars[fp],
+                                 width=18, height=18, corner_radius=3,
+                                 fg_color="#ff5555", border_color="#3a4055",
+                                 hover_color="#ff6e6e", checkmark_color="#fff")
+            cb.pack(side="left", padx=14)
+            sub_widgets.append(cb)
+
+            # Selectable path (tk.Entry for text selection)
+            ent = tk.Entry(fr, font=("Segoe UI", 10), fg="#c0c5d4", bg=bg,
+                           bd=0, readonlybackground=bg, highlightthickness=0,
+                           relief="flat", insertbackground="#8be9fd",
+                           selectbackground="#3a4055", selectforeground="#fff")
+            ent.insert(0, fp)
+            ent.configure(state="readonly")
+            ent.pack(side="left", fill="x", expand=True, padx=4)
+            sub_widgets.append(ent)
+
+            ctk.CTkLabel(fr, text=format_size(fs), font=ctk.CTkFont(size=10),
+                         text_color="#6272a4", width=70).pack(side="right", padx=4)
+            mtime_str = datetime.fromtimestamp(mt / 1e9).strftime("%Y-%m-%d %H:%M")
+            ctk.CTkLabel(fr, text=mtime_str, font=ctk.CTkFont(size=10),
+                         text_color="#6272a4", width=130).pack(side="right")
+            sub_widgets.append(fr)
+
+        # "全选/取消" toggles + delete button
+        tgl_frame = ctk.CTkFrame(rows_frame, fg_color="transparent")
+        tgl_frame.pack(fill="x", padx=20, pady=(4, 4))
+        ctk.CTkButton(tgl_frame, text="全选", width=50, height=22, corner_radius=4,
+                      fg_color="#2d1f1f", hover_color="#3d2828",
+                      text_color="#ff5555", font=ctk.CTkFont(size=10),
+                      command=lambda: [v.set(True) for v in del_vars.values()]).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(tgl_frame, text="取消", width=50, height=22, corner_radius=4,
+                      fg_color="#1a1d29", hover_color="#252a3d",
+                      text_color="#6272a4", font=ctk.CTkFont(size=10),
+                      command=lambda: [v.set(False) for v in del_vars.values()]).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(tgl_frame, text="🗑 删除勾选的文件", height=28, corner_radius=6,
+                      fg_color="#ef4444", hover_color="#dc2626",
+                      text_color="#fff", font=ctk.CTkFont(size=11, weight="bold"),
+                      command=lambda r=row: self._delete_checked_files(r)
+                      ).pack(side="left")
+        sub_widgets.extend(tgl_frame.winfo_children())
+
+        self._expanded_rows[row_id] = sub_widgets
+
+    def _delete_checked_files(self, row):
+        """Delete checked files from expanded group, keep unchecked ones."""
+        files = getattr(row, "_files", [])
+        if len(files) < 2:
+            return
+
+        # Find checked files by reading the sub-widget checkboxes
+        row_id = str(id(row))
+        checked = []
+        unchecked = []
+        for w in self._expanded_rows.get(row_id, []):
+            if isinstance(w, ctk.CTkCheckBox):
+                fp = w.master.winfo_children()[1]  # Entry widget
+                # Actually need to find the file path... Let me use _files + index
+                pass
+
+        # Better: iterate files and find their checkbox state from del_vars stored on row
+        # Let's store del_vars on the row for later retrieval
+        del_vars = getattr(row, "_del_vars", {})
+        if not del_vars:
+            return
+
+        checked = [fp for fp, var in del_vars.items() if var.get()]
+        if not checked:
+            messagebox.showwarning("提示", "请至少勾选一个要删除的文件")
+            return
+
+        keep = [fp for fp, var in del_vars.items() if not var.get()]
+        if not keep:
+            messagebox.showwarning("提示", "至少保留一个文件")
+            return
+
+        preview = "\n".join(p[:100] for p in checked[:5])
+        if len(checked) > 5:
+            preview += f"\n... 等共 {len(checked)} 个"
+
+        if not messagebox.askyesno("确认删除",
+            f"将删除 {len(checked)} 个文件，保留 {len(keep)} 个\n\n删除:\n{preview}"):
+            return
+
+        deleted = 0
+        for fp in checked:
+            try:
+                if os.path.exists(fp):
+                    os.remove(fp)
+                db = Database()
+                db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
+                db.conn.commit()
+                db.close()
+                deleted += 1
+            except Exception as e:
+                messagebox.showerror("错误", f"删除失败: {e}")
+
+        row.destroy()
+        self.status_lbl.configure(text=f"已删除 {deleted} 个重复文件")
+        self._load_data_async()
+
+    def _on_dup_right_click(self, event, row):
+        self._ctx_target = row
+        self._show_popup(event, is_group=True)
+
+    # ── Delete (simple) ──────────────────────────────────────────────────
+
+    def _delete_group_dups(self, row):
+        """Keep oldest, delete the rest."""
+        paths_str = getattr(row, "_paths", "")
+        if not paths_str: return
+        paths = paths_str.split("||")
+        if len(paths) < 2: return
+        keep, dels = paths[0], paths[1:]
+        preview = "\n".join(p[:100] for p in dels[:5])
+        if len(dels) > 5: preview += f"\n... 等共 {len(dels)} 个"
+        if not messagebox.askyesno("确认删除",
+            f"保留 1 个，删除其余 {len(dels)} 个\n\n保留:\n{keep}\n\n删除:\n{preview}"):
+            return
+        deleted = 0
+        for fp in dels:
+            try:
+                if os.path.exists(fp): os.remove(fp)
+                db = Database()
+                db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
+                db.conn.commit(); db.close()
+                deleted += 1
+            except Exception as e:
+                messagebox.showerror("错误", f"删除失败: {e}")
+        row.destroy()
+        self.status_lbl.configure(text=f"已删除 {deleted} 个重复文件")
+        self._load_data_async()
 
     def _render_search(self, results):
         outer, rows_frame, cols, widths = self.srch_outer, self.srch_rows, self.srch_cols, self.srch_widths
@@ -553,25 +791,7 @@ class App(ctk.CTk):
 
     # ── Click handlers ───────────────────────────────────────────────────
 
-    def _on_dup_click(self, event):
-        w = event.widget
-        # Walk up to find the row frame
-        while w and not hasattr(w, "_paths"):
-            w = w.master if hasattr(w, 'master') else None
-        if not w: return
-
-        # Check if clicking the last column (delete button area)
-        x = event.x
-        if x > 850:  # approximate action column area
-            self._delete_group_dups(w)
-            return
-
-        self._ctx_target = w
-        # Custom right-click menu
-        try:
-            self._show_popup(event, is_group=True)
-        except Exception:
-            pass
+    # _on_dup_click removed — left-click now handled by _toggle_expand in _render_dups
 
     def _on_search_click(self, event):
         w = event.widget

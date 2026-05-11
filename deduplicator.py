@@ -102,6 +102,10 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
             progress_interval=500,
         )
         db.conn.commit()
+        try:
+            db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
 
     # After quick_hash, mark unique qhash files as done
     qhash_groups = db.get_qhash_groups(min_group_size=2)
@@ -156,6 +160,10 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
                 progress_interval=50,
             )
             db.conn.commit()
+            try:
+                db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception:
+                pass
 
     elapsed = time.time() - scan_start
     if progress_callback:
@@ -173,6 +181,12 @@ def _flush_pass1(batch, db):
     for file_path, file_size, mtime_ns in batch:
         db.upsert_file(file_path, file_size, mtime_ns, status="sized")
     db.conn.commit()
+    # Periodic WAL checkpoint to prevent unbounded WAL growth
+    if len(batch) >= PASS1_BATCH:
+        try:
+            db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
 
 
 def _parallel_hash(

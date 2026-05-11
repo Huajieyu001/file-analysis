@@ -5,10 +5,20 @@
 """
 
 import os
+import sys
 
 # ---- 数据库 ----
-# SQLite 数据库文件路径，默认存放在项目根目录
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dedup.db")
+# PyInstaller 打包后 __file__ 指向临时目录，会丢失数据。
+# 所以优先使用 exe 同级目录，其次使用项目根目录。
+def _get_db_path():
+    if getattr(sys, 'frozen', False):
+        # PyInstaller: exe 所在目录
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "dedup.db")
+
+DB_PATH = _get_db_path()
 
 # ---- 哈希计算 ----
 # 快速哈希：仅读取文件头尾各 64KB，用于快速排除不同内容的同大小文件

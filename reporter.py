@@ -14,7 +14,7 @@ import sys
 from datetime import datetime
 
 # Windows 终端可能使用 GBK 编码，强制 UTF-8 避免路径中的特殊字符报错
-if sys.platform == "win32":
+if sys.platform == "win32" and sys.stdout is not None:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # 可读大小单位

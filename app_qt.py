@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-文件去重工具 — PySide6 桌面客户端
+CleanDup — PySide6 desktop client for duplicate file detection
 原生表格渲染，虚拟滚动，流畅不卡。
 """
 
@@ -33,7 +33,20 @@ VIDEO_EXTENSIONS = {
     "IPTV/录播": [".wtv", ".dvr-ms"],
     "其他": [".m4p", ".m4b", ".cpi", ".clpi"],
 }
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+def _app_dir():
+    """Persistent data directory — exe folder for PyInstaller, script folder for dev."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _resource_path(relative_path):
+    """Get path to bundled resource — works in PyInstaller and dev mode."""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller extracts bundled files to sys._MEIPASS
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+
+SETTINGS_FILE = os.path.join(_app_dir(), "settings.json")
 
 from config import DB_PATH, MIN_FILE_SIZE_MB
 from database import Database
@@ -324,12 +337,12 @@ class SettingsDialog(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("文件去重工具")
+        self.setWindowTitle("CleanDup")
         self.resize(1150, 720)
         self.setMinimumSize(900, 500)
 
         # Set icon
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+        icon_path = _resource_path("app_icon.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
@@ -594,21 +607,23 @@ class MainWindow(QMainWindow):
     # ── Scan ─────────────────────────────────────────────────────────────
 
     def _start_auto_scan(self):
-        # Clean stale records then do a full rescan on every startup
+        # Clean stale records then incremental scan — skips unchanged files
         QTimer.singleShot(300, self._clean_db_silent)
-        QTimer.singleShot(600, lambda: self._run_scan(True))
+        QTimer.singleShot(600, lambda: self._run_scan(False))
 
     def _clean_db_silent(self):
-        """Clean missing files without confirmation dialog."""
-        try:
-            db = Database()
-            db.init_db()
-            n = db.remove_nonexistent()
-            db.close()
-            if n > 0:
-                self.sbar.showMessage(f"清理了 {n} 条失效记录")
-        except Exception:
-            pass
+        """Clean missing files without confirmation dialog (runs in background)."""
+        def _run():
+            try:
+                db = Database()
+                db.init_db()
+                n = db.remove_nonexistent()
+                db.close()
+                if n > 0:
+                    self.sbar.showMessage(f"清理了 {n} 条失效记录")
+            except Exception:
+                pass
+        threading.Thread(target=_run, daemon=True).start()
 
     def _on_refresh_clicked(self):
         reply = QMessageBox.question(self, "确认", "全量刷新将重新扫描所有文件。确定？")
@@ -927,6 +942,11 @@ def _reveal_in_explorer(path):
 
 
 if __name__ == "__main__":
+    # Separate taskbar icon from python.exe on Windows
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CleanDup")
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")  # Consistent dark look across platforms
     window = MainWindow()
