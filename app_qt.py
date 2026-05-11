@@ -11,12 +11,14 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QCheckBox, QProgressBar,
     QTabWidget, QTableView, QHeaderView, QSplitter, QStatusBar,
     QMenu, QMessageBox, QFileDialog, QAbstractItemView, QStyledItemDelegate,
-    QFrame, QSizePolicy, QStyle, QStyleOptionButton,
+    QFrame, QSizePolicy,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, Signal, Slot, QTimer, QThread, QSize,
 )
 from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPalette, QIcon
+
+from send2trash import send2trash
 
 MB = 1024 * 1024
 
@@ -51,6 +53,8 @@ SETTINGS_FILE = os.path.join(_app_dir(), "settings.json")
 from config import DB_PATH, MIN_FILE_SIZE_MB
 from database import Database
 from deduplicator import run_dedup
+from scanner import walk_files
+from hasher import quick_hash
 from reporter import format_size
 
 
@@ -191,6 +195,21 @@ class DupGroupModel(QAbstractTableModel):
     def get_checked_count(self):
         return len(self._checked)
 
+    def sort(self, column, order=Qt.AscendingOrder):
+        """Sort groups by column. 0=checkbox, 1=#, 2=size, 3=count, 4=wasted, 5=path."""
+        key_map = {
+            1: lambda g: g[0].row,  # # — not meaningful, use index
+            2: lambda g: g[1],       # size
+            3: lambda g: len(g[2]),  # count
+            4: lambda g: (len(g[2]) - 1) * g[1],  # wasted
+            5: lambda g: g[2][0][0].lower(),       # path
+        }
+        key_fn = key_map.get(column, lambda g: (len(g[2]) - 1) * g[1])
+        self._checked.clear()
+        self.beginResetModel()
+        self._groups.sort(key=key_fn, reverse=(order == Qt.DescendingOrder))
+        self.endResetModel()
+
 
 class FileDetailModel(QAbstractTableModel):
     """Model for individual files within a duplicate group."""
@@ -305,6 +324,53 @@ class ScanWorker(QThread):
             db.close()
         except Exception as e:
             self.error.emit(str(e))
+
+
+# ─── Folder Compare ──────────────────────────────────────────────────────────
+
+class CompareResultModel(QAbstractTableModel):
+    """Model for folder comparison results."""
+    def __init__(self):
+        super().__init__()
+        self._pairs = []  # [(hash, size, path_a, path_b), ...]
+        self._headers = ["大小", "路径 (A)", "路径 (B)", "", ""]
+
+    def rowCount(self, parent=QModelIndex()): return len(self._pairs)
+    def columnCount(self, parent=QModelIndex()): return 5
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid(): return None
+        r, c = index.row(), index.column()
+        fhash, fsize, pa, pb = self._pairs[r]
+        if role == Qt.DisplayRole:
+            if c == 0: return format_size(fsize)
+            if c == 1: return pa
+            if c == 2: return pb
+            if c == 3: return "删A ←"
+            if c == 4: return "→ 删B"
+        if role == Qt.ForegroundRole:
+            if c in (3,): return QColor("#ff5555")
+            if c in (4,): return QColor("#ff9e64")
+            if c == 0: return QColor("#8be9fd")
+            return QColor("#c0c5d4")
+        if role == Qt.UserRole:
+            return (pa, pb)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self._headers[section]
+        return None
+
+    def set_pairs(self, pairs):
+        self.beginResetModel()
+        self._pairs = pairs
+        self.endResetModel()
+
+    def get_checked_paths(self, side):
+        """Get all paths from the specified side ('A' or 'B')."""
+        idx = 1 if side == "A" else 2
+        return [p[idx] for p in self._pairs]
 
 
 # ─── Settings Dialog ─────────────────────────────────────────────────────────
@@ -502,6 +568,12 @@ class MainWindow(QMainWindow):
         self.prog_text = QLabel("")
         self.prog_text.setStyleSheet("color: #6272a4; font-size: 11px;")
         main_layout.addWidget(self.prog_text)
+        # Smooth progress animation
+        self._prog_target = 0
+        self._prog_current = 0
+        self._prog_timer = QTimer()
+        self._prog_timer.timeout.connect(self._animate_progress)
+        self._prog_timer.start(30)  # ~33fps
 
         # ── Tabs ──
         self.tabs = QTabWidget()
@@ -535,7 +607,11 @@ class MainWindow(QMainWindow):
         self.dup_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.dup_table.setDragEnabled(True)
         self.dup_table.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self.dup_table.setSortingEnabled(True)
         self.dup_table.horizontalHeader().setStretchLastSection(True)
+        self.dup_table.horizontalHeader().setSortIndicatorShown(True)
+        # Default sort: column 4 (wasted) descending
+        self.dup_table.sortByColumn(4, Qt.DescendingOrder)
         self.dup_table.verticalHeader().setVisible(False)
         self.dup_table.setShowGrid(False)
         self.dup_table.setAlternatingRowColors(True)
@@ -607,6 +683,71 @@ class MainWindow(QMainWindow):
         search_layout.addWidget(self.search_table)
 
         self.tabs.addTab(search_widget, "搜索结果")
+
+        # Tab 3: Folder comparison
+        cmp_widget = QWidget()
+        cmp_layout = QVBoxLayout(cmp_widget)
+        cmp_layout.setContentsMargins(8, 8, 8, 8)
+
+        # Folder selectors
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("文件夹 A:"))
+        self.folder_a_input = QLineEdit()
+        self.folder_a_input.setPlaceholderText("选择左侧文件夹...")
+        folder_row.addWidget(self.folder_a_input)
+        btn_a = QPushButton("浏览...")
+        btn_a.clicked.connect(lambda: self._browse_folder(self.folder_a_input))
+        folder_row.addWidget(btn_a)
+        folder_row.addSpacing(20)
+        folder_row.addWidget(QLabel("文件夹 B:"))
+        self.folder_b_input = QLineEdit()
+        self.folder_b_input.setPlaceholderText("选择右侧文件夹...")
+        folder_row.addWidget(self.folder_b_input)
+        btn_b = QPushButton("浏览...")
+        btn_b.clicked.connect(lambda: self._browse_folder(self.folder_b_input))
+        folder_row.addWidget(btn_b)
+        cmp_layout.addLayout(folder_row)
+
+        # Compare button
+        cmp_btn_row = QHBoxLayout()
+        self.cmp_btn = QPushButton("🔍 开始比对")
+        self.cmp_btn.clicked.connect(self._start_folder_compare)
+        cmp_btn_row.addWidget(self.cmp_btn)
+        self.cmp_status = QLabel("")
+        self.cmp_status.setStyleSheet("color: #6272a4;")
+        cmp_btn_row.addWidget(self.cmp_status)
+        cmp_btn_row.addStretch()
+        # Delete action buttons
+        self.cmp_del_left_btn = QPushButton("删除 ← 左边(A)的重复文件")
+        self.cmp_del_left_btn.setStyleSheet("background-color: #ef4444; color: white;")
+        self.cmp_del_left_btn.clicked.connect(lambda: self._cmp_delete_side("A"))
+        self.cmp_del_left_btn.setEnabled(False)
+        cmp_btn_row.addWidget(self.cmp_del_left_btn)
+        self.cmp_del_right_btn = QPushButton("删除 → 右边(B)的重复文件")
+        self.cmp_del_right_btn.setStyleSheet("background-color: #ef4444; color: white;")
+        self.cmp_del_right_btn.clicked.connect(lambda: self._cmp_delete_side("B"))
+        self.cmp_del_right_btn.setEnabled(False)
+        cmp_btn_row.addWidget(self.cmp_del_right_btn)
+        cmp_layout.addLayout(cmp_btn_row)
+
+        # Results table
+        self.cmp_table = QTableView()
+        self.cmp_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.cmp_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.cmp_table.horizontalHeader().setStretchLastSection(True)
+        self.cmp_table.verticalHeader().setVisible(False)
+        self.cmp_table.setShowGrid(False)
+        self.cmp_table.setAlternatingRowColors(True)
+        self.cmp_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.cmp_table.customContextMenuRequested.connect(self._cmp_context_menu)
+        self.cmp_table.doubleClicked.connect(self._cmp_open_file)
+        self.cmp_model = CompareResultModel()
+        self.cmp_table.setModel(self.cmp_model)
+        self.cmp_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.cmp_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        cmp_layout.addWidget(self.cmp_table)
+
+        self.tabs.addTab(cmp_widget, "文件夹比对")
         main_layout.addWidget(self.tabs)
 
         # ── Status bar ──
@@ -619,6 +760,8 @@ class MainWindow(QMainWindow):
         self.sbar.addPermanentWidget(self.drive_capacity_lbl)
         # Keyboard navigation for dup table
         self.dup_table.selectionModel().currentChanged.connect(self._on_dup_current_changed)
+        # Sync checkboxes with rubber band / shift-click selection
+        self.dup_table.selectionModel().selectionChanged.connect(self._on_dup_selection_changed)
         # Update drive capacity on startup, when drives toggled, and every 30s
         self._update_drive_capacity()
         for cb in self.drive_checks.values():
@@ -650,7 +793,12 @@ class MainWindow(QMainWindow):
 
     # ── Data loading ─────────────────────────────────────────────────────
 
-    def _load_data(self):
+    def _load_data(self, on_done=None):
+        # Save current sort state before reload
+        hdr = self.dup_table.horizontalHeader()
+        sort_col = hdr.sortIndicatorSection()
+        sort_ord = hdr.sortIndicatorOrder()
+
         def _load():
             try:
                 db = Database()
@@ -660,22 +808,24 @@ class MainWindow(QMainWindow):
                 wasted = format_size(stats["wasted_bytes"])
                 self.sbar.showMessage(f"已索引 {total:,} 个文件  ·  {dupc:,} 组重复  ·  可释放 {wasted}")
 
-                # Search: first 200
                 rows = db.search_files("", limit=200) if total > 0 else []
                 data = [(fp, format_size(fs), f"{dc}个重复" if dc > 0 else "唯一")
                         for fp, fs, _, _, _, dc in rows]
                 self.search_model.set_data(data)
                 self.search_count.setText(f"显示前 {len(data)} / {total:,}")
 
-                # Dup groups: first 200
                 groups = db.get_duplicate_groups()
                 dup_list = []
                 for fhash, fsize, files in groups:
                     dup_list.append((fhash, fsize, sorted(files, key=lambda x: x[2])))
                 dup_list.sort(key=lambda g: (len(g[2]) - 1) * g[1], reverse=True)
-                self.dup_model.set_groups(dup_list[:200])
+                self.dup_model.set_groups(dup_list)
                 self.dup_groups = dup_list
                 db.close()
+                # Restore sort order AFTER data is loaded
+                self.dup_table.sortByColumn(sort_col, sort_ord)
+                if on_done:
+                    on_done()
             except Exception:
                 pass
         threading.Thread(target=_load, daemon=True).start()
@@ -727,10 +877,16 @@ class MainWindow(QMainWindow):
             return
 
         self.scan_running = True
+        # Clear tables to prevent accidental operations on stale data
+        self.dup_model.set_groups([])
+        self.detail_widget.setVisible(False)
+        self.search_model.set_data([])
         self.status_lbl.setText("● 扫描中...")
         self.status_lbl.setStyleSheet("color: #f59e0b; font-weight: bold;")
         self.incr_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
+        self._prog_target = 0
+        self._prog_current = 0
         self.prog_bar.setValue(0)
 
         exts = self.active_exts if self.active_exts else None
@@ -749,20 +905,28 @@ class MainWindow(QMainWindow):
     @Slot(str, str)
     def _on_scan_progress(self, stage, msg):
         pct = self._calc_pct(stage, msg)
-        self.prog_bar.setValue(int(pct * 100))
+        self._prog_target = int(pct * 100)
         self.prog_text.setText(f"{pct:.2f}%  {msg}")
 
     @Slot(list, int, int)
     def _on_scan_done(self, dup_list, total, wasted):
         self.scan_running = False
+        self._prog_target = 10000
+        self._prog_current = 10000
         self.prog_bar.setValue(10000)
-        self.prog_text.setText(f"100.00%  扫描完成  ·  {total:,} 文件  ·  {len(dup_list):,} 组重复  ·  可释放 {format_size(wasted)}")
+        # Use DB stats for consistent numbers with status bar
+        db = Database()
+        stats = db.get_stats()
+        db.close()
+        db_wasted = format_size(stats["wasted_bytes"])
+        db_groups = stats["duplicate_groups"]
+        self.prog_text.setText(f"100.00%  扫描完成  ·  {stats['total_files']:,} 文件  ·  {db_groups:,} 组重复  ·  可释放 {db_wasted}")
         self.status_lbl.setText("✓ 已是最新")
         self.status_lbl.setStyleSheet("color: #22c55e; font-weight: bold;")
         self.incr_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
         self.dup_groups = dup_list
-        self.dup_model.set_groups(dup_list[:200])
+        self.dup_model.set_groups(dup_list)
         self._update_drive_capacity()
         self._load_data()
 
@@ -774,6 +938,18 @@ class MainWindow(QMainWindow):
         self.status_lbl.setStyleSheet("color: #ff5555; font-weight: bold;")
         self.incr_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
+
+    def _animate_progress(self):
+        """Smoothly animate progress bar toward target."""
+        if self._prog_current < self._prog_target:
+            # Move 1-5% of the gap per frame, faster for bigger gaps
+            gap = self._prog_target - self._prog_current
+            step = max(1, gap // 20)  # ~0.5s to cover any gap at 30fps
+            self._prog_current = min(self._prog_current + step, self._prog_target)
+            self.prog_bar.setValue(self._prog_current)
+        elif self._prog_current > self._prog_target:
+            self._prog_current = self._prog_target
+            self.prog_bar.setValue(self._prog_current)
 
     def _calc_pct(self, stage, msg):
         fast = not self.full_hash_cb.isChecked()
@@ -832,41 +1008,71 @@ class MainWindow(QMainWindow):
             f"预计释放 {format_size(total_wasted)}\n\n确定？")
         if reply != QMessageBox.Yes: return
 
-        deleted = 0
-        errors = 0
-        for ghash, fsize, files in groups:
-            files_sorted = sorted(files, key=lambda x: x[2])  # oldest first
-            for fp, fs, mt in files_sorted[1:]:  # delete all except first
-                try:
-                    if os.path.exists(fp): os.remove(fp)
-                    db = Database()
-                    db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
-                    db.conn.commit(); db.close()
-                    deleted += 1
-                except Exception:
-                    errors += 1
+        self.status_lbl.setText("● 清理中...")
+        self.status_lbl.setStyleSheet("color: #f59e0b; font-weight: bold;")
 
-        saved = format_size(total_wasted) if errors == 0 else "部分"
-        self.sbar.showMessage(f"批量清理完成: 删除 {deleted} 个文件，释放约 {saved}")
-        self._load_data()
-        self.detail_widget.setVisible(False)
+        def _run():
+            deleted = 0
+            errors = 0
+            for ghash, fsize, files in groups:
+                files_sorted = sorted(files, key=lambda x: x[2])
+                for fp, fs, mt in files_sorted[1:]:
+                    try:
+                        if os.path.exists(fp): send2trash(fp)
+                        db = Database()
+                        db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
+                        db.conn.commit(); db.close()
+                        deleted += 1
+                    except Exception:
+                        errors += 1
+
+            saved = format_size(total_wasted) if errors == 0 else "部分"
+            self.sbar.showMessage(f"批量清理完成: 删除 {deleted} 个文件，释放约 {saved}")
+            self.status_lbl.setText("✓ 已是最新")
+            self.status_lbl.setStyleSheet("color: #22c55e; font-weight: bold;")
+            self._load_data()
+            self.detail_widget.setVisible(False)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_dup_selection_changed(self, selected, deselected):
+        """Toggle checkboxes for rows added/removed during drag or shift-click."""
+        if not (QApplication.mouseButtons() & Qt.LeftButton):
+            return
+        # Collect unique rows from selected ranges
+        rows_changed = set()
+        for rng in (selected + deselected):
+            for row in range(rng.top(), rng.bottom() + 1):
+                rows_changed.add(row)
+        if not rows_changed:
+            return
+        # Toggle each row: checked ↔ unchecked
+        for r in rows_changed:
+            if r in self.dup_model._checked:
+                self.dup_model._checked.discard(r)
+            else:
+                self.dup_model._checked.add(r)
+        # Refresh all changed rows
+        if rows_changed:
+            top = self.dup_model.index(min(rows_changed), 0)
+            bot = self.dup_model.index(max(rows_changed), 0)
+            self.dup_model.dataChanged.emit(top, bot, [Qt.CheckStateRole])
+        self._update_batch_ui()
 
     def _on_dup_current_changed(self, current, previous):
         """Keyboard navigation: update detail panel when selection moves."""
         if not current.isValid(): return
         row = current.row()
-        if 0 <= row < len(self.dup_groups):
-            ghash, fsize, files = self.dup_groups[row]
+        if 0 <= row < len(self.dup_model._groups):
+            ghash, fsize, files = self.dup_model._groups[row]
             self.detail_model.set_files(files)
             self.detail_widget.setVisible(True)
             self._update_toggle_btn()
-            self._current_dup_row = row
-            self._current_dup_files = files
+            self._current_model_row = row
 
     def _on_dup_table_clicked(self, index):
         """Handle clicks: column 0 = toggle checkbox, others = expand group."""
         if index.column() == 0:
-            # Toggle checkbox directly (Qt setData unreliable for this)
             r = index.row()
             if r in self.dup_model._checked:
                 self.dup_model._checked.discard(r)
@@ -876,20 +1082,19 @@ class MainWindow(QMainWindow):
             self._update_batch_ui()
             return
 
-        # Expand group detail
+        # Expand group detail (read from model, authoritative after sorting)
         row = index.row()
-        if 0 <= row < len(self.dup_groups):
-            ghash, fsize, files = self.dup_groups[row]
+        if 0 <= row < len(self.dup_model._groups):
+            ghash, fsize, files = self.dup_model._groups[row]
             self.detail_model.set_files(files)
             self.detail_widget.setVisible(True)
             self._update_toggle_btn()
-            self._current_dup_row = row
-            self._current_dup_files = files
+            self._current_model_row = row
 
     def _reveal_dup_file(self, index):
         row = index.row()
-        if 0 <= row < len(self.dup_groups):
-            _reveal_in_explorer(self.dup_groups[row][2][0][0])
+        if 0 <= row < len(self.dup_model._groups):
+            _reveal_in_explorer(self.dup_model._groups[row][2][0][0])
 
     def _on_detail_checkbox_clicked(self, index):
         """Toggle checkbox for column 0 clicks."""
@@ -954,7 +1159,7 @@ class MainWindow(QMainWindow):
         deleted = 0
         for fp in checked:
             try:
-                if os.path.exists(fp): os.remove(fp)
+                if os.path.exists(fp): send2trash(fp)
                 db = Database()
                 db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
                 db.conn.commit(); db.close()
@@ -1006,7 +1211,7 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(self, "确认删除", f"确定删除此文件？\n\n{fp}")
         if reply != QMessageBox.Yes: return
         try:
-            if os.path.exists(fp): os.remove(fp)
+            if os.path.exists(fp): send2trash(fp)
             db = Database()
             db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
             db.conn.commit(); db.close()
@@ -1016,26 +1221,27 @@ class MainWindow(QMainWindow):
             # Immediately update detail model — remove the deleted file
             new_files = [(p, s, m, c) for p, s, m, c in self.detail_model._files if p != fp]
             if len(new_files) <= 1:
-                # No longer a duplicate group — remove from dup list entirely
+                # No longer a duplicate group — remove from model
                 self.detail_widget.setVisible(False)
-                if hasattr(self, '_current_dup_row'):
-                    self.dup_groups.pop(self._current_dup_row)
-                self.dup_model.set_groups(self.dup_groups[:200])
+                if hasattr(self, '_current_model_row'):
+                    r = self._current_model_row
+                    if r < len(self.dup_model._groups):
+                        self.dup_model._groups.pop(r)
+                        self.dup_model.set_groups(self.dup_model._groups)
             else:
-                # Update the files in the current dup group
                 self.detail_model._files = new_files
                 self.detail_model.beginResetModel()
                 self.detail_model.endResetModel()
-                # Update dup_groups and dup_model
-                if hasattr(self, '_current_dup_row') and hasattr(self, '_current_dup_files'):
-                    old_files = self._current_dup_files
-                    remaining = [(p, s, m) for p, s, m in old_files if p != fp]
-                    if remaining:
-                        ghash, fsize, _ = self.dup_groups[self._current_dup_row]
-                        self.dup_groups[self._current_dup_row] = (ghash, fsize, remaining)
-                        self.dup_model.set_groups(self.dup_groups[:200])
+                # Update the group's files in the model
+                if hasattr(self, '_current_model_row'):
+                    r = self._current_model_row
+                    if r < len(self.dup_model._groups):
+                        ghash, fsize, old_files = self.dup_model._groups[r]
+                        remaining = [(p, s, m) for p, s, m in old_files if p != fp]
+                        if remaining:
+                            self.dup_model._groups[r] = (ghash, fsize, remaining)
+                            self.dup_model.set_groups(self.dup_model._groups)
 
-            # Background reload to sync stats
             self._load_data()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"删除失败: {e}")
@@ -1073,6 +1279,120 @@ class MainWindow(QMainWindow):
             export_json(g, fn, db); db.close()
             self.sbar.showMessage(f"已导出: {os.path.basename(fn)}")
 
+    # ── Folder Compare ───────────────────────────────────────────────────
+
+    def _browse_folder(self, line_edit):
+        folder = QFileDialog.getExistingDirectory(self, "选择文件夹")
+        if folder:
+            line_edit.setText(folder)
+
+    def _start_folder_compare(self):
+        fa = self.folder_a_input.text().strip()
+        fb = self.folder_b_input.text().strip()
+        if not fa or not fb:
+            QMessageBox.warning(self, "提示", "请先选择两个文件夹")
+            return
+
+        self.cmp_btn.setEnabled(False)
+        self.cmp_status.setText("● 比对中...")
+        self.cmp_status.setStyleSheet("color: #f59e0b;")
+
+        exts = self.active_exts if self.active_exts else None
+        try:
+            min_mb = int(self.min_size_input.text().strip() or "0")
+        except ValueError:
+            min_mb = 0
+
+        def _run():
+            try:
+                import config as cfg
+                if min_mb > 0:
+                    cfg.MIN_FILE_SIZE = min_mb * MB
+
+                hashes_a = {}
+                for fp, fsize, _ in walk_files([fa], extensions=exts):
+                    qh = quick_hash(fp)
+                    if qh:
+                        if qh not in hashes_a:
+                            hashes_a[qh] = []
+                        hashes_a[qh].append((fp, fsize))
+
+                hashes_b = {}
+                for fp, fsize, _ in walk_files([fb], extensions=exts):
+                    qh = quick_hash(fp)
+                    if qh:
+                        if qh not in hashes_b:
+                            hashes_b[qh] = []
+                        hashes_b[qh].append((fp, fsize))
+
+                # Find matching hashes
+                common = set(hashes_a.keys()) & set(hashes_b.keys())
+                pairs = []
+                for qh in sorted(common):
+                    for pa, fsize in hashes_a[qh]:
+                        for pb, _ in hashes_b[qh]:
+                            pairs.append((qh, fsize, pa, pb))
+
+                pairs.sort(key=lambda x: x[1], reverse=True)
+                self.cmp_model.set_pairs(pairs)
+
+                wasted = sum(p[1] for p in pairs)
+                self.cmp_status.setText(
+                    f"✓ 完成: {len(pairs)} 对重复  |  每对可释放 {format_size(wasted) if wasted > 0 else '0 B'}")
+                self.cmp_status.setStyleSheet("color: #22c55e;")
+                self.cmp_del_left_btn.setEnabled(len(pairs) > 0)
+                self.cmp_del_right_btn.setEnabled(len(pairs) > 0)
+            except Exception as e:
+                self.cmp_status.setText(f"✗ 错误: {e}")
+                self.cmp_status.setStyleSheet("color: #ff5555;")
+            finally:
+                self.cmp_btn.setEnabled(True)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _cmp_delete_side(self, side):
+        pairs = self.cmp_model._pairs
+        if not pairs: return
+        idx = 2 if side == "A" else 3  # p[2]=path_a, p[3]=path_b in tuple (hash, size, pa, pb)
+        count = len(pairs)
+        wasted = sum(p[1] for p in pairs)
+        label = "左边(A)" if side == "A" else "右边(B)"
+
+        reply = QMessageBox.question(self, "确认删除",
+            f"将删除 {label} 的 {count} 个重复文件\n"
+            f"预计释放 {format_size(wasted)}\n\n确定？")
+        if reply != QMessageBox.Yes: return
+
+        deleted = 0
+        for p in pairs:
+            fp = p[idx]
+            try:
+                if os.path.exists(fp): send2trash(fp)
+                deleted += 1
+            except Exception:
+                pass
+
+        self.cmp_model.set_pairs([])
+        self.cmp_status.setText(f"✓ 已删除 {label}: {deleted} 个文件  |  释放 {format_size(wasted)}")
+        self.cmp_del_left_btn.setEnabled(False)
+        self.cmp_del_right_btn.setEnabled(False)
+
+    def _cmp_context_menu(self, pos):
+        index = self.cmp_table.indexAt(pos)
+        if not index.isValid(): return
+        pa, pb = self.cmp_model.data(index, Qt.UserRole) or ("", "")
+        menu = QMenu(self)
+        menu.addAction("📂 打开 A 位置", lambda: _reveal_in_explorer(pa))
+        menu.addAction("📂 打开 B 位置", lambda: _reveal_in_explorer(pb))
+        menu.addSeparator()
+        menu.addAction("🗑 删除 A", lambda: self._delete_one_file(pa))
+        menu.addAction("🗑 删除 B", lambda: self._delete_one_file(pb))
+        menu.exec(QCursor.pos())
+
+    def _cmp_open_file(self, index):
+        pa, pb = self.cmp_model.data(index, Qt.UserRole) or ("", "")
+        if pa: _reveal_in_explorer(pa)
+
     # ── Clean ─────────────────────────────────────────────────────────────
 
     def _clean_db(self):
@@ -1102,7 +1422,7 @@ class MainWindow(QMainWindow):
                     self.incr_btn.setEnabled(True)
                     self.refresh_btn.setEnabled(True)
                     self.dup_groups = dup_list
-                    self.dup_model.set_groups(dup_list[:200])
+                    self.dup_model.set_groups(dup_list)
                     self._load_data()
                 elif msg[0] == "error":
                     self.prog_text.setText(f"错误: {msg[1]}")
