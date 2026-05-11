@@ -527,8 +527,16 @@ class MainWindow(QMainWindow):
 
         # Min size
         ctrl_row.addWidget(QLabel("最小(MB):"))
-        self.min_size_input = QLineEdit(str(MIN_FILE_SIZE_MB))
+        # Load saved min size or use config default
+        saved_min = str(MIN_FILE_SIZE_MB)
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, encoding="utf-8") as f:
+                    saved_min = str(json.load(f).get("min_size_mb", MIN_FILE_SIZE_MB))
+            except: pass
+        self.min_size_input = QLineEdit(saved_min)
         self.min_size_input.setFixedWidth(50)
+        self.min_size_input.textChanged.connect(self._save_min_size)
         ctrl_row.addWidget(self.min_size_input)
 
         ctrl_row.addStretch()
@@ -1248,6 +1256,26 @@ class MainWindow(QMainWindow):
 
     # ── Settings ──────────────────────────────────────────────────────────
 
+    def _save_min_size(self):
+        """Persist min size and schedule an incremental scan."""
+        try:
+            settings = {}
+            if os.path.exists(SETTINGS_FILE):
+                with open(SETTINGS_FILE, encoding="utf-8") as f:
+                    settings = json.load(f)
+            settings["min_size_mb"] = int(self.min_size_input.text().strip() or "0")
+            settings.setdefault("extensions", sorted(self.active_exts))
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+        except: pass
+        # Debounced auto-rescan 2s after user stops typing
+        if hasattr(self, '_min_size_timer'):
+            self._min_size_timer.stop()
+        self._min_size_timer = QTimer()
+        self._min_size_timer.setSingleShot(True)
+        self._min_size_timer.timeout.connect(lambda: self._run_scan(False))
+        self._min_size_timer.start(2000)
+
     def _open_settings(self):
         dlg = SettingsDialog(self.active_exts, self)
         dlg.show()
@@ -1306,8 +1334,8 @@ class MainWindow(QMainWindow):
         def _run():
             try:
                 import config as cfg
-                if min_mb > 0:
-                    cfg.MIN_FILE_SIZE = min_mb * MB
+                # Folder compare scans ALL files regardless of min size setting
+                cfg.MIN_FILE_SIZE = 1  # only skip empty files
 
                 hashes_a = {}
                 for fp, fsize, _ in walk_files([fa], extensions=exts):
