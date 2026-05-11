@@ -327,9 +327,11 @@ class ScanWorker(QThread):
 
 
 # ─── Folder Compare ──────────────────────────────────────────────────────────
+# Compares two folders by quick-hash, finds files existing in both.
+# Delete buttons remove all duplicates from one side or the other.
 
 class CompareResultModel(QAbstractTableModel):
-    """Model for folder comparison results."""
+    """Model for folder comparison results. Columns: size, path_a, path_b, actions."""
     def __init__(self):
         super().__init__()
         self._pairs = []  # [(hash, size, path_a, path_b), ...]
@@ -374,9 +376,11 @@ class CompareResultModel(QAbstractTableModel):
 
 
 # ─── Local Dedup Check ───────────────────────────────────────────────────────
+# Given a folder, finds files within it that have duplicates elsewhere in the DB.
+# Two modes: delete local copies (keep others) or keep local (delete others).
 
 class LocalCheckModel(QAbstractTableModel):
-    """Model for local folder dedup check results."""
+    """Model for local folder dedup check. Columns: size, local path, other paths, action."""
     def __init__(self):
         super().__init__()
         self._rows = []  # [(local_path, size, dup_paths_list), ...]
@@ -416,7 +420,8 @@ class LocalCheckModel(QAbstractTableModel):
         return [r[0] for r in self._rows]
 
 
-# ─── Empty Files ─────────────────────────────────────────────────────────────
+# ─── Empty Files Cleanup ─────────────────────────────────────────────────────
+# Scans selected drives for 0-byte files and empty folders. Delete to recycle bin.
 
 class EmptyFilesModel(QAbstractTableModel):
     def __init__(self):
@@ -681,17 +686,13 @@ class MainWindow(QMainWindow):
         self.status_lbl.setStyleSheet("color: #f59e0b; font-weight: bold;")
         btn_row.addWidget(self.status_lbl)
 
-        self.incr_btn = QPushButton("↻ 增量更新")
-        self.incr_btn.clicked.connect(lambda: self._run_scan(False))
-        btn_row.addWidget(self.incr_btn)
-
         self.refresh_btn = QPushButton("⟳ 全量刷新")
         self.refresh_btn.clicked.connect(self._on_refresh_clicked)
         btn_row.addWidget(self.refresh_btn)
 
         btn_row.addStretch()
 
-        for txt, slot in [("设置", self._open_settings), ("清理DB", self._clean_db)]:
+        for txt, slot in [("设置", self._open_settings)]:
             btn = QPushButton(txt)
             btn.clicked.connect(slot)
             btn_row.addWidget(btn)
@@ -1075,23 +1076,8 @@ class MainWindow(QMainWindow):
     # ── Scan ─────────────────────────────────────────────────────────────
 
     def _start_auto_scan(self):
-        # Clean stale records then incremental scan — skips unchanged files
-        QTimer.singleShot(300, self._clean_db_silent)
-        QTimer.singleShot(600, lambda: self._run_scan(False))
-
-    def _clean_db_silent(self):
-        """Clean missing files without confirmation dialog (runs in background)."""
-        def _run():
-            try:
-                db = Database()
-                db.init_db()
-                n = db.remove_nonexistent()
-                db.close()
-                if n > 0:
-                    self.sbar.showMessage(f"清理了 {n} 条失效记录")
-            except Exception:
-                pass
-        threading.Thread(target=_run, daemon=True).start()
+        # Full scan on startup
+        QTimer.singleShot(600, lambda: self._run_scan(True))
 
     def _on_refresh_clicked(self):
         reply = QMessageBox.question(self, "确认", "全量刷新将重新扫描所有文件。确定？")
@@ -1112,7 +1098,6 @@ class MainWindow(QMainWindow):
         self.search_model.set_data([])
         self.status_lbl.setText("● 扫描中...")
         self.status_lbl.setStyleSheet("color: #f59e0b; font-weight: bold;")
-        self.incr_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
         self._prog_target = 0
         self._prog_current = 0
@@ -1149,7 +1134,6 @@ class MainWindow(QMainWindow):
         self.prog_text.setText(f"100.00%  扫描完成  ·  {stats['total_files']:,} 文件  ·  {db_groups:,} 组重复  ·  可释放 {db_wasted}")
         self.status_lbl.setText("✓ 已是最新")
         self.status_lbl.setStyleSheet("color: #22c55e; font-weight: bold;")
-        self.incr_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
         self.dup_groups = dup_list
         self.dup_model.set_groups(dup_list)
@@ -1162,7 +1146,6 @@ class MainWindow(QMainWindow):
         self.prog_text.setText(f"错误: {err}")
         self.status_lbl.setText("✗ 扫描出错")
         self.status_lbl.setStyleSheet("color: #ff5555; font-weight: bold;")
-        self.incr_btn.setEnabled(True)
         self.refresh_btn.setEnabled(True)
 
     def _animate_progress(self):
@@ -1882,14 +1865,6 @@ class MainWindow(QMainWindow):
         # Don't clear list so user can see what was done; they can re-scan
 
     # ── Clean ─────────────────────────────────────────────────────────────
-
-    def _clean_db(self):
-        reply = QMessageBox.question(self, "确认", "清理数据库中已不存在的文件记录？")
-        if reply == QMessageBox.Yes:
-            db = Database(); db.init_db()
-            n = db.remove_nonexistent(); db.close()
-            self.sbar.showMessage(f"已清理 {n} 条记录")
-            self._load_data()
 
     # ── Progress polling ─────────────────────────────────────────────────
 
