@@ -416,6 +416,67 @@ class LocalCheckModel(QAbstractTableModel):
         return [r[0] for r in self._rows]
 
 
+# ─── Empty Files ─────────────────────────────────────────────────────────────
+
+class EmptyFilesModel(QAbstractTableModel):
+    def __init__(self):
+        super().__init__()
+        self._items = []  # [(type_str, path, size), ...]  type: "空文件" / "空文件夹"
+        self._checked = set()
+        self._headers = ["", "类型", "路径", "大小"]
+
+    def rowCount(self, parent=QModelIndex()): return len(self._items)
+    def columnCount(self, parent=QModelIndex()): return 4
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid(): return None
+        r, c = index.row(), index.column()
+        typ, path, size = self._items[r]
+        if role == Qt.CheckStateRole and c == 0:
+            return Qt.Checked if r in self._checked else Qt.Unchecked
+        if role == Qt.DisplayRole:
+            if c == 0: return ""
+            if c == 1: return typ
+            if c == 2: return path
+            if c == 3: return format_size(size)
+        if role == Qt.ForegroundRole:
+            if c == 1: return QColor("#f59e0b") if "夹" in typ else QColor("#ff5555")
+            return QColor("#c0c5d4")
+        if role == Qt.UserRole:
+            return path
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self._headers[section]
+        return None
+
+    def flags(self, index):
+        if index.column() == 0:
+            return Qt.ItemIsUserCheckable | Qt.ItemIsEnabled
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+
+    def set_items(self, items):
+        self.beginResetModel()
+        self._items = items
+        self._checked = set(range(len(items)))  # default: all checked
+        self.endResetModel()
+
+    def check_all(self):
+        self._checked = set(range(len(self._items)))
+        self.beginResetModel(); self.endResetModel()
+
+    def uncheck_all(self):
+        self._checked.clear()
+        self.beginResetModel(); self.endResetModel()
+
+    def get_checked(self):
+        return [self._items[r] for r in sorted(self._checked)]
+
+    def get_checked_count(self):
+        return len(self._checked)
+
+
 # ─── Settings Dialog ─────────────────────────────────────────────────────────
 
 class SettingsDialog(QWidget):
@@ -878,6 +939,44 @@ class MainWindow(QMainWindow):
         local_layout.addWidget(self.local_table)
 
         self.tabs.addTab(local_widget, "本地查重")
+
+        # Tab 5: Clean empty files
+        empty_widget = QWidget()
+        empty_layout = QVBoxLayout(empty_widget)
+        empty_layout.setContentsMargins(8, 8, 8, 8)
+
+        empty_btn_row = QHBoxLayout()
+        self.empty_scan_btn = QPushButton("🔍 扫描空文件/空文件夹")
+        self.empty_scan_btn.clicked.connect(self._start_empty_scan)
+        empty_btn_row.addWidget(self.empty_scan_btn)
+        self.empty_status = QLabel("")
+        self.empty_status.setStyleSheet("color: #6272a4;")
+        empty_btn_row.addWidget(self.empty_status)
+        empty_btn_row.addStretch()
+        self.empty_del_btn = QPushButton("🗑 删除选中的项目")
+        self.empty_del_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold;")
+        self.empty_del_btn.clicked.connect(self._delete_empty_items)
+        self.empty_del_btn.setEnabled(False)
+        empty_btn_row.addWidget(self.empty_del_btn)
+        self.empty_toggle_btn = QPushButton("全选")
+        self.empty_toggle_btn.clicked.connect(self._empty_toggle_all)
+        empty_btn_row.addWidget(self.empty_toggle_btn)
+        empty_layout.addLayout(empty_btn_row)
+
+        self.empty_table = QTableView()
+        self.empty_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.empty_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.empty_table.horizontalHeader().setStretchLastSection(True)
+        self.empty_table.verticalHeader().setVisible(False)
+        self.empty_table.setShowGrid(False)
+        self.empty_table.setAlternatingRowColors(True)
+        self.empty_model = EmptyFilesModel()
+        self.empty_table.setModel(self.empty_model)
+        self.empty_table.clicked.connect(self._on_empty_table_clicked)
+        self.empty_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        empty_layout.addWidget(self.empty_table)
+
+        self.tabs.addTab(empty_widget, "清理空文件")
         main_layout.addWidget(self.tabs)
 
         # ── Status bar ──
@@ -1668,6 +1767,119 @@ class MainWindow(QMainWindow):
     def _local_open_file(self, index):
         fp = self.local_model.data(index, Qt.UserRole)
         if fp: _reveal_in_explorer(fp)
+
+    # ── Empty Files Cleanup ──────────────────────────────────────────────
+
+    def _start_empty_scan(self):
+        drives = [f"{d}:\\" for d, cb in self.drive_checks.items() if cb.isChecked()]
+        if not drives:
+            QMessageBox.warning(self, "提示", "请至少勾选一个盘符")
+            return
+
+        self.empty_scan_btn.setEnabled(False)
+        self.empty_status.setText("● 扫描中...")
+        self.empty_status.setStyleSheet("color: #f59e0b;")
+        self.empty_del_btn.setEnabled(False)
+
+        def _run():
+            items = []
+            for drive in drives:
+                try:
+                    for root, dirs, files in os.walk(drive):
+                        # Skip system dirs
+                        dirs[:] = [d for d in dirs if d not in {
+                            "$RECYCLE.BIN", "System Volume Information",
+                            "Windows", "Program Files", "Program Files (x86)",
+                            "ProgramData", "Recovery", ".git", "__pycache__",
+                            "node_modules"} and not d.startswith(".")]
+
+                        for fname in files:
+                            fp = os.path.join(root, fname)
+                            try:
+                                if os.path.getsize(fp) == 0 and os.path.isfile(fp):
+                                    items.append(("空文件", fp, 0))
+                                    # Limit to avoid memory issues
+                                    if len(items) >= 50000:
+                                        break
+                            except OSError:
+                                pass
+                        if len(items) >= 50000:
+                            break
+
+                        # Check if folder is empty or only contains empty files
+                        try:
+                            all_files = [os.path.join(root, f) for f in files]
+                            has_content = False
+                            for fp in all_files:
+                                try:
+                                    if os.path.getsize(fp) > 0:
+                                        has_content = True
+                                        break
+                                except OSError:
+                                    pass
+                            if not files and not dirs:
+                                items.append(("空文件夹", root, 0))
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+
+            # Sort: folders first, then by path
+            items.sort(key=lambda x: (0 if "夹" in x[0] else 1, x[1]))
+            self.empty_model.set_items(items)
+            self.empty_status.setText(f"✓ 找到 {len(items)} 个空文件/空文件夹")
+            self.empty_status.setStyleSheet("color: #22c55e;")
+            self.empty_del_btn.setEnabled(len(items) > 0)
+            self.empty_scan_btn.setEnabled(True)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_empty_table_clicked(self, index):
+        if index.column() == 0:
+            r = index.row()
+            if r in self.empty_model._checked:
+                self.empty_model._checked.discard(r)
+            else:
+                self.empty_model._checked.add(r)
+            self.empty_model.dataChanged.emit(index, index, [Qt.CheckStateRole])
+            self._update_empty_toggle_btn()
+
+    def _empty_toggle_all(self):
+        if self.empty_model.get_checked_count() == len(self.empty_model._items):
+            self.empty_model.uncheck_all()
+        else:
+            self.empty_model.check_all()
+        self._update_empty_toggle_btn()
+
+    def _update_empty_toggle_btn(self):
+        n = self.empty_model.get_checked_count()
+        all_checked = n == len(self.empty_model._items) and n > 0
+        self.empty_toggle_btn.setText("取消全选" if all_checked else "全选")
+
+    def _delete_empty_items(self):
+        checked = self.empty_model.get_checked()
+        if not checked:
+            QMessageBox.warning(self, "提示", "请勾选要删除的项目")
+            return
+
+        empty_files = sum(1 for t, _, _ in checked if "文件" in t)
+        empty_dirs = len(checked) - empty_files
+        reply = QMessageBox.question(self, "确认删除",
+            f"将删除 {empty_files} 个空文件 + {empty_dirs} 个空文件夹\n共 {len(checked)} 项\n\n确定？")
+        if reply != QMessageBox.Yes: return
+
+        deleted = 0
+        errors = 0
+        for typ, path, _ in checked:
+            try:
+                send2trash(path)
+                deleted += 1
+            except Exception:
+                errors += 1
+
+        self.empty_status.setText(f"✓ 已删除 {deleted} 项" + (f"  ({errors} 失败)" if errors else ""))
+        self.empty_del_btn.setEnabled(False)
+        # Don't clear list so user can see what was done; they can re-scan
 
     # ── Clean ─────────────────────────────────────────────────────────────
 
