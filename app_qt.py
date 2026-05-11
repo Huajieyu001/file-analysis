@@ -9,6 +9,7 @@ from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QCheckBox, QProgressBar,
+    QScrollArea,
     QTabWidget, QTableView, QHeaderView, QSplitter, QStatusBar,
     QMenu, QMessageBox, QFileDialog, QAbstractItemView, QStyledItemDelegate,
     QFrame, QSizePolicy,
@@ -298,9 +299,8 @@ class ScanWorker(QThread):
 
     def run(self):
         try:
-            import config as cfg
-            if self.min_mb > 0:
-                cfg.MIN_FILE_SIZE = self.min_mb * MB
+            import scanner
+            scanner.MIN_FILE_SIZE = max(1, self.min_mb * MB)
 
             db = Database()
             db.init_db()
@@ -373,64 +373,144 @@ class CompareResultModel(QAbstractTableModel):
         return [p[idx] for p in self._pairs]
 
 
+# ─── Local Dedup Check ───────────────────────────────────────────────────────
+
+class LocalCheckModel(QAbstractTableModel):
+    """Model for local folder dedup check results."""
+    def __init__(self):
+        super().__init__()
+        self._rows = []  # [(local_path, size, dup_paths_list), ...]
+        self._headers = ["大小", "本文件夹内", "其他位置重复", ""]
+
+    def rowCount(self, parent=QModelIndex()): return len(self._rows)
+    def columnCount(self, parent=QModelIndex()): return 4
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid(): return None
+        r, c = index.row(), index.column()
+        local_path, fsize, dup_paths = self._rows[r]
+        if role == Qt.DisplayRole:
+            if c == 0: return format_size(fsize)
+            if c == 1: return local_path
+            if c == 2: return "\n".join(dup_paths[:3]) + (f"\n... 等 {len(dup_paths)} 个" if len(dup_paths) > 3 else "")
+            if c == 3: return "删除本地"
+        if role == Qt.ForegroundRole:
+            if c in (3,): return QColor("#ff5555")
+            if c == 0: return QColor("#8be9fd")
+            return QColor("#c0c5d4")
+        if role == Qt.UserRole:
+            return local_path
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self._headers[section]
+        return None
+
+    def set_rows(self, rows):
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def get_all_local_paths(self):
+        return [r[0] for r in self._rows]
+
+
 # ─── Settings Dialog ─────────────────────────────────────────────────────────
 
 class SettingsDialog(QWidget):
-    def __init__(self, current_exts, parent=None):
+    def __init__(self, current_exts, full_hash_enabled, min_size_mb, parent=None):
         super().__init__(parent, Qt.Window | Qt.Dialog)
-        self.setWindowTitle("文件后缀设置")
-        self.setMinimumSize(500, 400)
+        self.setWindowTitle("设置")
+        self.setMinimumSize(560, 480)
         self.ext_vars = {}
         self.saved = False
-        self.result = current_exts
+        self.result_exts = current_exts
+        self.result_full_hash = full_hash_enabled
+        self.result_min_size = min_size_mb
 
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel("选择要扫描的文件后缀（未勾选的会被跳过）"))
+        tabs = QTabWidget()
 
-        # Quick buttons
+        # Tab 1: Scan options
+        scan_tab = QWidget()
+        scan_layout = QVBoxLayout(scan_tab)
+        scan_layout.addWidget(QLabel("扫描选项"))
+
+        self.full_hash_cb = QCheckBox("全量哈希（精确模式，速度慢）")
+        self.full_hash_cb.setChecked(full_hash_enabled)
+        scan_layout.addWidget(self.full_hash_cb)
+
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("最小文件大小 (MB):"))
+        self.min_size_input = QLineEdit(str(min_size_mb))
+        self.min_size_input.setFixedWidth(80)
+        size_row.addWidget(self.min_size_input)
+        size_row.addStretch()
+        scan_layout.addLayout(size_row)
+        scan_layout.addStretch()
+        tabs.addTab(scan_tab, "扫描选项")
+
+        # Tab 2: File extensions
+        ext_tab = QWidget()
+        ext_layout = QVBoxLayout(ext_tab)
+
         qa = QHBoxLayout()
         for txt, fn in [("全选", lambda: self._sel(True)), ("取消全选", lambda: self._sel(False))]:
             btn = QPushButton(txt)
             btn.clicked.connect(fn)
             qa.addWidget(btn)
-        layout.addLayout(qa)
+        ext_layout.addLayout(qa)
 
-        # Categories with checkboxes
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
         for cat, exts in VIDEO_EXTENSIONS.items():
             cat_cb = QCheckBox(cat)
             cat_cb.setChecked(all(e in current_exts for e in exts))
             cat_cb.toggled.connect(lambda checked, c=cat: self._tgl_cat(c, checked))
-            layout.addWidget(cat_cb)
+            scroll_layout.addWidget(cat_cb)
 
             row_layout = QHBoxLayout()
             for ext in exts:
                 cb = QCheckBox(ext)
                 cb.setChecked(ext in current_exts)
-                cb.toggled.connect(lambda checked, c=cat: self._sync_cat(c))
                 self.ext_vars[ext] = cb
                 row_layout.addWidget(cb)
-            layout.addLayout(row_layout)
+            scroll_layout.addLayout(row_layout)
+        scroll.setWidget(scroll_content)
+        ext_layout.addWidget(scroll)
+        tabs.addTab(ext_tab, "文件后缀")
 
-        # Save button
-        btn = QPushButton("保存设置")
-        btn.clicked.connect(self._save)
-        layout.addWidget(btn)
+        layout.addWidget(tabs)
+
+        # Save
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.close)
+        btn_row.addWidget(cancel_btn)
+        save_btn = QPushButton("保存设置")
+        save_btn.setStyleSheet("background-color: #3b82f6; color: white; font-weight: bold;")
+        save_btn.clicked.connect(self._save)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
 
     def _tgl_cat(self, cat, checked):
         for e in VIDEO_EXTENSIONS.get(cat, []):
             if e in self.ext_vars:
                 self.ext_vars[e].setChecked(checked)
 
-    def _sync_cat(self, cat):
-        pass  # Simplified; could update category checkbox state
-
     def _sel(self, state):
         for cb in self.ext_vars.values():
             cb.setChecked(state)
 
     def _save(self):
-        self.result = {e for e, cb in self.ext_vars.items() if cb.isChecked()}
+        self.result_exts = {e for e, cb in self.ext_vars.items() if cb.isChecked()}
+        self.result_full_hash = self.full_hash_cb.isChecked()
+        self.result_min_size = int(self.min_size_input.text().strip() or "0")
         self.saved = True
         self.close()
 
@@ -455,12 +535,22 @@ class MainWindow(QMainWindow):
         # State
         self.scan_running = False
         self.active_exts = load_settings()
+        # Load saved scan options
+        self.full_hash_enabled = False
+        self.min_size_mb_val = MIN_FILE_SIZE_MB
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, encoding="utf-8") as f:
+                    s = json.load(f)
+                    self.full_hash_enabled = s.get("full_hash", False)
+                    self.min_size_mb_val = s.get("min_size_mb", MIN_FILE_SIZE_MB)
+            except: pass
+
         self.db = Database()
         self.progress_queue = queue.Queue()
         self.dup_groups = []
-        self.expanded_row = -1  # Currently expanded group index
+        self.expanded_row = -1
 
-        # Scan worker placeholder
         self.scan_worker = None
 
         self._build_ui()
@@ -520,25 +610,6 @@ class MainWindow(QMainWindow):
                 ctrl_row.addWidget(cb)
 
         ctrl_row.addSpacing(12)
-
-        # Full hash
-        self.full_hash_cb = QCheckBox("全量哈希（慢）")
-        ctrl_row.addWidget(self.full_hash_cb)
-
-        # Min size
-        ctrl_row.addWidget(QLabel("最小(MB):"))
-        # Load saved min size or use config default
-        saved_min = str(MIN_FILE_SIZE_MB)
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, encoding="utf-8") as f:
-                    saved_min = str(json.load(f).get("min_size_mb", MIN_FILE_SIZE_MB))
-            except: pass
-        self.min_size_input = QLineEdit(saved_min)
-        self.min_size_input.setFixedWidth(50)
-        self.min_size_input.textChanged.connect(self._save_min_size)
-        ctrl_row.addWidget(self.min_size_input)
-
         ctrl_row.addStretch()
         main_layout.addLayout(ctrl_row)
 
@@ -559,8 +630,7 @@ class MainWindow(QMainWindow):
 
         btn_row.addStretch()
 
-        for txt, slot in [("设置", self._open_settings), ("清理DB", self._clean_db),
-                           ("导出CSV", self._export_csv), ("导出JSON", self._export_json)]:
+        for txt, slot in [("设置", self._open_settings), ("清理DB", self._clean_db)]:
             btn = QPushButton(txt)
             btn.clicked.connect(slot)
             btn_row.addWidget(btn)
@@ -756,6 +826,58 @@ class MainWindow(QMainWindow):
         cmp_layout.addWidget(self.cmp_table)
 
         self.tabs.addTab(cmp_widget, "文件夹比对")
+
+        # Tab 4: Local dedup check
+        local_widget = QWidget()
+        local_layout = QVBoxLayout(local_widget)
+        local_layout.setContentsMargins(8, 8, 8, 8)
+
+        local_row = QHBoxLayout()
+        local_row.addWidget(QLabel("文件夹:"))
+        self.local_folder_input = QLineEdit()
+        self.local_folder_input.setPlaceholderText("输入要查询的文件夹路径...")
+        local_row.addWidget(self.local_folder_input)
+        btn_local = QPushButton("浏览...")
+        btn_local.clicked.connect(lambda: self._browse_folder(self.local_folder_input))
+        local_row.addWidget(btn_local)
+        local_layout.addLayout(local_row)
+
+        local_btn_row = QHBoxLayout()
+        self.local_check_btn = QPushButton("🔍 查询重复")
+        self.local_check_btn.clicked.connect(self._start_local_check)
+        local_btn_row.addWidget(self.local_check_btn)
+        self.local_status = QLabel("")
+        self.local_status.setStyleSheet("color: #6272a4;")
+        local_btn_row.addWidget(self.local_status)
+        local_btn_row.addStretch()
+        self.local_del_btn = QPushButton("🗑 删除本文件夹（保留其他）")
+        self.local_del_btn.setStyleSheet("background-color: #ef4444; color: white; font-weight: bold;")
+        self.local_del_btn.clicked.connect(self._local_delete_all)
+        self.local_del_btn.setEnabled(False)
+        local_btn_row.addWidget(self.local_del_btn)
+        self.local_keep_btn = QPushButton("📌 保留本文件夹（删除其他）")
+        self.local_keep_btn.setStyleSheet("background-color: #f59e0b; color: #0d1117; font-weight: bold;")
+        self.local_keep_btn.clicked.connect(self._local_keep_all)
+        self.local_keep_btn.setEnabled(False)
+        local_btn_row.addWidget(self.local_keep_btn)
+        local_layout.addLayout(local_btn_row)
+
+        self.local_table = QTableView()
+        self.local_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.local_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.local_table.horizontalHeader().setStretchLastSection(True)
+        self.local_table.verticalHeader().setVisible(False)
+        self.local_table.setShowGrid(False)
+        self.local_table.setAlternatingRowColors(True)
+        self.local_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.local_table.customContextMenuRequested.connect(self._local_context_menu)
+        self.local_table.doubleClicked.connect(self._local_open_file)
+        self.local_model = LocalCheckModel()
+        self.local_table.setModel(self.local_model)
+        self.local_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        local_layout.addWidget(self.local_table)
+
+        self.tabs.addTab(local_widget, "本地查重")
         main_layout.addWidget(self.tabs)
 
         # ── Status bar ──
@@ -898,13 +1020,10 @@ class MainWindow(QMainWindow):
         self.prog_bar.setValue(0)
 
         exts = self.active_exts if self.active_exts else None
-        try:
-            min_mb = int(self.min_size_input.text().strip() or "0")
-        except ValueError:
-            min_mb = 200
+        min_mb = self.min_size_mb_val
 
         self.scan_worker = ScanWorker(drives, force, exts,
-                                      not self.full_hash_cb.isChecked(), min_mb)
+                                      not self.full_hash_enabled, min_mb)
         self.scan_worker.progress.connect(self._on_scan_progress)
         self.scan_worker.finished.connect(self._on_scan_done)
         self.scan_worker.error.connect(self._on_scan_error)
@@ -960,7 +1079,7 @@ class MainWindow(QMainWindow):
             self.prog_bar.setValue(self._prog_current)
 
     def _calc_pct(self, stage, msg):
-        fast = not self.full_hash_cb.isChecked()
+        fast = not self.full_hash_enabled
         if stage == "pass1_done": return 35.0 if fast else 25.0
         if stage == "pass2_done": return 100.0 if fast else 70.0
         if stage == "pass3_done": return 100.0
@@ -1263,7 +1382,7 @@ class MainWindow(QMainWindow):
             if os.path.exists(SETTINGS_FILE):
                 with open(SETTINGS_FILE, encoding="utf-8") as f:
                     settings = json.load(f)
-            settings["min_size_mb"] = int(self.min_size_input.text().strip() or "0")
+            settings["min_size_mb"] = self.min_size_mb_val
             settings.setdefault("extensions", sorted(self.active_exts))
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
@@ -1277,35 +1396,28 @@ class MainWindow(QMainWindow):
         self._min_size_timer.start(2000)
 
     def _open_settings(self):
-        dlg = SettingsDialog(self.active_exts, self)
+        dlg = SettingsDialog(self.active_exts, self.full_hash_enabled,
+                             self.min_size_mb_val, self)
         dlg.show()
-        # Hack: wait for dialog close
         while dlg.isVisible():
             QApplication.processEvents()
         if dlg.saved:
-            self.active_exts = dlg.result
-            save_settings(dlg.result)
-            self.sbar.showMessage(f"设置已保存 ({len(dlg.result)} 个后缀)")
+            self.active_exts = dlg.result_exts
+            self.full_hash_enabled = dlg.result_full_hash
+            self.min_size_mb_val = dlg.result_min_size
+            # Persist to settings.json
+            s = {"extensions": sorted(dlg.result_exts),
+                 "full_hash": dlg.result_full_hash,
+                 "min_size_mb": dlg.result_min_size}
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(s, f, ensure_ascii=False, indent=2)
+            self.sbar.showMessage(
+                f"设置已保存 ({len(dlg.result_exts)} 个后缀, 最小 {dlg.result_min_size} MB)")
+            # Auto-rescan with new settings
+            if not self.scan_running:
+                QTimer.singleShot(500, lambda: self._run_scan(False))
 
     # ── Export ────────────────────────────────────────────────────────────
-
-    def _export_csv(self):
-        from reporter import export_csv
-        fn, _ = QFileDialog.getSaveFileName(self, "导出CSV",
-            f"dupes-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv", "CSV (*.csv)")
-        if fn:
-            db = Database(); g = db.get_duplicate_groups()
-            export_csv(g, fn, db); db.close()
-            self.sbar.showMessage(f"已导出: {os.path.basename(fn)}")
-
-    def _export_json(self):
-        from reporter import export_json
-        fn, _ = QFileDialog.getSaveFileName(self, "导出JSON",
-            f"dupes-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json", "JSON (*.json)")
-        if fn:
-            db = Database(); g = db.get_duplicate_groups()
-            export_json(g, fn, db); db.close()
-            self.sbar.showMessage(f"已导出: {os.path.basename(fn)}")
 
     # ── Folder Compare ───────────────────────────────────────────────────
 
@@ -1327,15 +1439,14 @@ class MainWindow(QMainWindow):
 
         exts = self.active_exts if self.active_exts else None
         try:
-            min_mb = int(self.min_size_input.text().strip() or "0")
+            min_mb = self.min_size_mb_val
         except ValueError:
             min_mb = 0
 
         def _run():
             try:
-                import config as cfg
-                # Folder compare scans ALL files regardless of min size setting
-                cfg.MIN_FILE_SIZE = 1  # only skip empty files
+                import scanner
+                scanner.MIN_FILE_SIZE = 1  # check all files
 
                 hashes_a = {}
                 for fp, fsize, _ in walk_files([fa], extensions=exts):
@@ -1420,6 +1531,143 @@ class MainWindow(QMainWindow):
     def _cmp_open_file(self, index):
         pa, pb = self.cmp_model.data(index, Qt.UserRole) or ("", "")
         if pa: _reveal_in_explorer(pa)
+
+    # ── Local Dedup Check ────────────────────────────────────────────────
+
+    def _start_local_check(self):
+        folder = self.local_folder_input.text().strip()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "提示", "请输入有效的文件夹路径")
+            return
+
+        self.local_check_btn.setEnabled(False)
+        self.local_status.setText("● 查询中...")
+        self.local_status.setStyleSheet("color: #f59e0b;")
+        self.local_del_btn.setEnabled(False)
+
+        exts = self.active_exts if self.active_exts else None
+
+        def _run():
+            try:
+                import scanner
+                scanner.MIN_FILE_SIZE = 1  # check all files
+
+                # Get quick hashes for files in this folder
+                local_files = {}
+                for fp, fsize, _ in walk_files([folder], extensions=exts):
+                    qh = quick_hash(fp)
+                    if qh:
+                        if qh not in local_files:
+                            local_files[qh] = []
+                        local_files[qh].append((fp, fsize))
+
+                # For each hash, search DB for matching files elsewhere
+                rows = []
+                db = Database()
+                for qh, files in local_files.items():
+                    db_files = db.conn.execute(
+                        "SELECT file_path, file_size FROM file_index "
+                        "WHERE (quick_hash = ? OR full_hash = ?) AND status = 'full_hashed'",
+                        (qh, qh)
+                    ).fetchall()
+                    # Filter: exclude files already in the scanned folder
+                    dup_elsewhere = [(fp, fs) for fp, fs in db_files
+                                     if not fp.startswith(folder)]
+                    if dup_elsewhere:
+                        for local_fp, local_fs in files:
+                            rows.append((local_fp, max(local_fs, dup_elsewhere[0][1]),
+                                         [f"{fp}  ({format_size(fs)})" for fp, fs in dup_elsewhere]))
+                db.close()
+
+                rows.sort(key=lambda r: r[1], reverse=True)
+
+                self.local_model.set_rows(rows)
+                wasted = sum(r[1] for r in rows)
+                self.local_status.setText(
+                    f"✓ {len(rows)} 个文件在其他位置有重复  |  可释放 {format_size(wasted) if rows else '0 B'}")
+                self.local_status.setStyleSheet("color: #22c55e;")
+                self.local_del_btn.setEnabled(len(rows) > 0)
+                self.local_keep_btn.setEnabled(len(rows) > 0)
+            except Exception as e:
+                self.local_status.setText(f"✗ 错误: {e}")
+                self.local_status.setStyleSheet("color: #ff5555;")
+            finally:
+                self.local_check_btn.setEnabled(True)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _local_delete_all(self):
+        paths = self.local_model.get_all_local_paths()
+        if not paths: return
+        wasted = sum(r[1] for r in self.local_model._rows)
+        reply = QMessageBox.question(self, "确认删除",
+            f"将删除本文件夹内的 {len(paths)} 个文件\n"
+            f"保留其他位置的副本\n预计释放 {format_size(wasted)}\n\n确定？")
+        if reply != QMessageBox.Yes: return
+
+        deleted = 0
+        for fp in paths:
+            try:
+                if os.path.exists(fp): send2trash(fp)
+                db = Database()
+                db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
+                db.conn.commit(); db.close()
+                deleted += 1
+            except Exception:
+                pass
+        self.local_model.set_rows([])
+        self.local_status.setText(f"✓ 已删除 {deleted} 个文件  |  释放 {format_size(wasted)}")
+        self.local_del_btn.setEnabled(False)
+        self.local_keep_btn.setEnabled(False)
+
+    def _local_keep_all(self):
+        """Keep local files, delete all duplicates elsewhere."""
+        # Collect all duplicate paths from the model rows (column 2)
+        all_dup_paths = []
+        wasted = 0
+        for local_path, fsize, dup_paths in self.local_model._rows:
+            wasted += fsize
+            for dp in dup_paths:
+                # Extract path from "path  (size)" format
+                fp = dp.rsplit("  (", 1)[0] if "  (" in dp else dp
+                all_dup_paths.append(fp)
+        if not all_dup_paths: return
+
+        reply = QMessageBox.question(self, "确认删除",
+            f"保留本文件夹的文件，删除其他位置的 {len(all_dup_paths)} 个副本\n"
+            f"预计释放 {format_size(wasted)}\n\n确定？")
+        if reply != QMessageBox.Yes: return
+
+        deleted = 0
+        for fp in all_dup_paths:
+            try:
+                if os.path.exists(fp): send2trash(fp)
+                db = Database()
+                db.conn.execute("DELETE FROM file_index WHERE file_path=?", (fp,))
+                db.conn.commit(); db.close()
+                deleted += 1
+            except Exception:
+                pass
+        self.local_model.set_rows([])
+        self.local_status.setText(f"✓ 保留本地，已删除其他位置 {deleted} 个文件")
+        self.local_del_btn.setEnabled(False)
+        self.local_keep_btn.setEnabled(False)
+
+    def _local_context_menu(self, pos):
+        index = self.local_table.indexAt(pos)
+        if not index.isValid(): return
+        fp = self.local_model.data(index, Qt.UserRole)
+        if not fp: return
+        menu = QMenu(self)
+        menu.addAction("📂 打开文件位置", lambda: _reveal_in_explorer(fp))
+        menu.addAction("📋 复制路径", lambda: QApplication.clipboard().setText(fp))
+        menu.addSeparator()
+        menu.addAction("🗑 删除此文件", lambda: self._delete_one_file(fp))
+        menu.exec(QCursor.pos())
+
+    def _local_open_file(self, index):
+        fp = self.local_model.data(index, Qt.UserRole)
+        if fp: _reveal_in_explorer(fp)
 
     # ── Clean ─────────────────────────────────────────────────────────────
 
