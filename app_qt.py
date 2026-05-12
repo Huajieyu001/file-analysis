@@ -1369,9 +1369,11 @@ class MainWindow(QMainWindow):
 
     def _on_dup_selection_changed(self, selected, deselected):
         """Toggle checkboxes for rows added/removed during drag or shift-click."""
-        if not (QApplication.mouseButtons() & Qt.LeftButton):
+        is_drag = bool(QApplication.mouseButtons() & Qt.LeftButton)
+        is_shift = bool(QApplication.keyboardModifiers() & Qt.ShiftModifier)
+        if not (is_drag or is_shift):
             return
-        # Use all currently selected rows for shift-drag (avoids missing last row)
+        # For shift-click, process all currently-selected rows
         sel_rows = {i.row() for i in self.dup_table.selectionModel().selectedRows()}
         if len(sel_rows) <= 1:
             return  # Single click handled by _on_dup_table_clicked
