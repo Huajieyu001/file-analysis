@@ -1248,23 +1248,24 @@ class MainWindow(QMainWindow):
         """Toggle checkboxes for rows added/removed during drag or shift-click."""
         if not (QApplication.mouseButtons() & Qt.LeftButton):
             return
-        # Collect unique rows from selected ranges
-        rows_changed = set()
-        for rng in (selected + deselected):
+        # Use all currently selected rows for shift-drag (avoids missing last row)
+        sel_rows = {i.row() for i in self.dup_table.selectionModel().selectedRows()}
+        if len(sel_rows) <= 1:
+            return  # Single click handled by _on_dup_table_clicked
+        rows_added = set()
+        for rng in selected:
             for row in range(rng.top(), rng.bottom() + 1):
-                rows_changed.add(row)
-        if not rows_changed:
+                rows_added.add(row)
+        if not rows_added:
             return
-        # Toggle each row: checked ↔ unchecked
-        for r in rows_changed:
-            if r in self.dup_model._checked:
-                self.dup_model._checked.discard(r)
-            else:
-                self.dup_model._checked.add(r)
-        # Refresh all changed rows
-        if rows_changed:
-            top = self.dup_model.index(min(rows_changed), 0)
-            bot = self.dup_model.index(max(rows_changed), 0)
+        make_checked = min(rows_added) not in self.dup_model._checked
+        if make_checked:
+            self.dup_model._checked.update(sel_rows)
+        else:
+            self.dup_model._checked.difference_update(sel_rows)
+        if sel_rows:
+            top = self.dup_model.index(min(sel_rows), 0)
+            bot = self.dup_model.index(max(sel_rows), 0)
             self.dup_model.dataChanged.emit(top, bot, [Qt.CheckStateRole])
         self._update_batch_ui()
 
@@ -1280,25 +1281,24 @@ class MainWindow(QMainWindow):
             self._current_model_row = row
 
     def _on_dup_table_clicked(self, index):
-        """Handle clicks: column 0 = toggle checkbox, others = expand group."""
-        if index.column() == 0:
-            r = index.row()
-            if r in self.dup_model._checked:
-                self.dup_model._checked.discard(r)
-            else:
-                self.dup_model._checked.add(r)
-            self.dup_model.dataChanged.emit(index, index, [Qt.CheckStateRole])
-            self._update_batch_ui()
-            return
+        """Clicking any column on a row toggles its checkbox."""
+        r = index.row()
+        if r in self.dup_model._checked:
+            self.dup_model._checked.discard(r)
+        else:
+            self.dup_model._checked.add(r)
+        # Refresh the checkbox column
+        cb_idx = self.dup_model.index(r, 0)
+        self.dup_model.dataChanged.emit(cb_idx, cb_idx, [Qt.CheckStateRole])
+        self._update_batch_ui()
 
-        # Expand group detail (read from model, authoritative after sorting)
-        row = index.row()
-        if 0 <= row < len(self.dup_model._groups):
-            ghash, fsize, files = self.dup_model._groups[row]
+        # Also update the detail panel
+        if 0 <= r < len(self.dup_model._groups):
+            ghash, fsize, files = self.dup_model._groups[r]
             self.detail_model.set_files(files)
             self.detail_widget.setVisible(True)
             self._update_toggle_btn()
-            self._current_model_row = row
+            self._current_model_row = r
 
     def _reveal_dup_file(self, index):
         row = index.row()
@@ -1495,9 +1495,9 @@ class MainWindow(QMainWindow):
                 json.dump(s, f, ensure_ascii=False, indent=2)
             self.sbar.showMessage(
                 f"设置已保存 ({len(dlg.result_exts)} 个后缀, 最小 {dlg.result_min_size} MB)")
-            # Auto-rescan with new settings
-            if not self.scan_running:
-                QTimer.singleShot(500, lambda: self._run_scan(False))
+            # Stop current scan (if any) and restart with new settings
+            self.scan_running = False
+            QTimer.singleShot(300, lambda: self._run_scan(True))
 
     # ── Export ────────────────────────────────────────────────────────────
 
