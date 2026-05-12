@@ -1238,9 +1238,12 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str)
     def _on_scan_progress(self, stage, msg):
-        pct = self._calc_pct(stage, msg)
-        self._prog_target = int(pct * 100)
-        self.prog_text.setText(f"{pct:.2f}%  {msg}")
+        if stage == "timing":
+            self._scan_timing = msg  # saved for _on_scan_done
+        else:
+            pct = self._calc_pct(stage, msg)
+            self._prog_target = int(pct * 100)
+            self.prog_text.setText(f"{pct:.2f}%  {msg}")
 
     @Slot(list, object, object)
     def _on_scan_done(self, dup_list, total, wasted):
@@ -1254,7 +1257,9 @@ class MainWindow(QMainWindow):
         db.close()
         db_wasted = format_size(stats["wasted_bytes"])
         db_groups = stats["duplicate_groups"]
-        self.prog_text.setText(f"100.00%  扫描完成  ·  {stats['total_files']:,} 文件  ·  {db_groups:,} 组重复  ·  可释放 {db_wasted}")
+        timing = getattr(self, '_scan_timing', '')
+        timing_text = f"  |  {timing}" if timing else ""
+        self.prog_text.setText(f"100.00%  扫描完成  ·  {stats['total_files']:,} 文件  ·  {db_groups:,} 组重复  ·  可释放 {db_wasted}{timing_text}")
         self.status_lbl.setText("✓ 已是最新")
         self.status_lbl.setStyleSheet("color: #22c55e; font-weight: bold;")
         self.refresh_btn.setEnabled(True)

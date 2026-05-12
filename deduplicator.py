@@ -32,7 +32,14 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
     Pass 2: For same-size groups, compute quick_hash in parallel.
     Pass 3: For same quick_hash groups, compute full_hash (skipped in fast_mode).
     """
-    scan_start = time.time()
+    t0 = time.time()
+
+    # Force mode: mark all existing as missing first, then let the scan re-discover them
+    # This ensures files deleted from disk are properly cleaned out
+    if force:
+        db.conn.execute("UPDATE file_index SET status='missing' WHERE status != 'missing'")
+        db.conn.commit()
+
     # Always load existing paths to detect deleted files
     existing = db.existing_paths_map()
 
@@ -40,9 +47,12 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
     if progress_callback:
         progress_callback("pass1_start", "Scanning files...")
 
+    pass1_start = time.time()
+
     batch = []
     new_count = 0
     skipped_count = 0
+    # Track which files from DB still exist on disk
     missing_set = set(existing.keys())
 
     for file_path, file_size, mtime_ns in walk_files(paths, extensions=extensions):
@@ -72,14 +82,16 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
     for path in missing_set:
         db.mark_missing(path)
 
+    pass1_time = time.time() - pass1_start
     if progress_callback:
         progress_callback(
             "pass1_done",
             f"Pass 1 done: {new_count} new/changed, {skipped_count} unchanged, "
-            f"{len(missing_set)} removed",
+            f"{len(missing_set)} removed ({pass1_time:.1f}s)",
         )
 
     # ---- Pass 2: Quick hash for same-size groups ----
+    pass2_start = time.time()
     if progress_callback:
         progress_callback("pass2_start", "Computing quick hashes...")
 
@@ -165,13 +177,16 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
             except Exception:
                 pass
 
-    elapsed = time.time() - scan_start
+    total_time = time.time() - t0
+    pass2_time = time.time() - pass2_start
     if progress_callback:
         progress_callback(
             "done",
-            f"Scan complete in {elapsed:.1f}s. "
+            f"Scan complete in {total_time:.1f}s. "
             f"Total files: {new_count + skipped_count}, duplicates found.",
         )
+        progress_callback("timing",
+            f"总耗时 {total_time:.1f}秒 | 快速Hash耗时 {pass2_time:.1f}秒 | 扫描文件耗时 {pass1_time:.1f}秒")
 
     return db.get_duplicate_groups()
 
