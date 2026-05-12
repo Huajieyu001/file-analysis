@@ -34,7 +34,30 @@ VIDEO_EXTENSIONS = {
     "监控 DVR/NVR": [".h264", ".h265", ".264", ".265", ".avc", ".hevc", ".bvr"],
     "视频编辑/代理": [".yuv", ".vdr", ".pva", ".nsv", ".nut", ".roq", ".bik", ".smk", ".swf"],
     "IPTV/录播": [".wtv", ".dvr-ms"],
-    "其他": [".m4p", ".m4b", ".cpi", ".clpi"],
+    "其他视频": [".m4p", ".m4b", ".cpi", ".clpi"],
+}
+IMAGE_EXTENSIONS = {
+    "常见图片": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".svg"],
+    "RAW/专业": [".raw", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2", ".pef", ".raf",
+                  ".sr2", ".srf", ".dcr", ".kdc", ".mrw", ".erf", ".3fr", ".fff", ".mef", ".mdc"],
+    "其他图片": [".ico", ".heic", ".heif", ".psd", ".ai", ".eps", ".cdr", ".xcf"],
+}
+AUDIO_EXTENSIONS = {
+    "常见音频": [".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a", ".opus"],
+    "无损/专业": [".alac", ".ape", ".aiff", ".dsf", ".dff", ".pcm"],
+    "其他音频": [".mid", ".midi", ".amr", ".ac3", ".dts", ".ra"],
+}
+DOC_EXTENSIONS = {
+    "文档": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv", ".md"],
+    "压缩包": [".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso"],
+    "代码/配置": [".py", ".js", ".ts", ".html", ".css", ".json", ".xml", ".yaml", ".ini", ".cfg"],
+}
+# Category hierarchy for settings UI
+EXTENSION_CATEGORIES = {
+    "视频": VIDEO_EXTENSIONS,
+    "图片": IMAGE_EXTENSIONS,
+    "音频": AUDIO_EXTENSIONS,
+    "文档/其他": DOC_EXTENSIONS,
 }
 def _app_dir():
     """Persistent data directory — exe folder for PyInstaller, script folder for dev."""
@@ -63,9 +86,13 @@ def load_settings():
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, encoding="utf-8") as f:
-                exts = set(json.load(f).get("extensions", []))
+                s = json.load(f)
+                if s.get("scan_all", False):
+                    return None  # None = scan all files
+                exts = set(s.get("extensions", []))
                 if exts: return exts
         except: pass
+    # Default: all video extensions
     all_exts = set()
     for g in VIDEO_EXTENSIONS.values(): all_exts.update(g)
     return all_exts
@@ -199,7 +226,6 @@ class DupGroupModel(QAbstractTableModel):
     def sort(self, column, order=Qt.AscendingOrder):
         """Sort groups by column. 0=checkbox, 1=#, 2=size, 3=count, 4=wasted, 5=path."""
         key_map = {
-            1: lambda g: g[0].row,  # # — not meaningful, use index
             2: lambda g: g[1],       # size
             3: lambda g: len(g[2]),  # count
             4: lambda g: (len(g[2]) - 1) * g[1],  # wasted
@@ -286,7 +312,7 @@ class FileDetailModel(QAbstractTableModel):
 
 class ScanWorker(QThread):
     progress = Signal(str, str)   # stage, message
-    finished = Signal(list, int, int)  # dup_list, total_files, wasted_bytes
+    finished = Signal(list, object, object)  # dup_list, total_files, wasted_bytes (object for large ints)
     error = Signal(str)
 
     def __init__(self, drives, force, extensions, fast_mode, min_mb):
@@ -485,21 +511,23 @@ class EmptyFilesModel(QAbstractTableModel):
 # ─── Settings Dialog ─────────────────────────────────────────────────────────
 
 class SettingsDialog(QWidget):
-    def __init__(self, current_exts, full_hash_enabled, min_size_mb, parent=None):
+    def __init__(self, current_exts, full_hash_enabled, min_size_mb, scan_all, parent=None):
         super().__init__(parent, Qt.Window | Qt.Dialog)
         self.setWindowTitle("设置")
-        self.setMinimumSize(560, 480)
-        self.ext_vars = {}
+        self.setMinimumSize(600, 540)
+        self.ext_vars = {}       # {ext: checkbox, ...}
+        self.cat_vars = {}       # {sub_cat_name: checkbox, ...}
+        self.big_cat_vars = {}   # {big_cat_name: checkbox, ...}
         self.saved = False
         self.result_exts = current_exts
         self.result_full_hash = full_hash_enabled
         self.result_min_size = min_size_mb
+        self.scan_all = scan_all  # True if exts is None
 
         layout = QVBoxLayout(self)
-
         tabs = QTabWidget()
 
-        # Tab 1: Scan options
+        # ---- Tab 1: Scan options ----
         scan_tab = QWidget()
         scan_layout = QVBoxLayout(scan_tab)
         scan_layout.addWidget(QLabel("扫描选项"))
@@ -518,41 +546,80 @@ class SettingsDialog(QWidget):
         scan_layout.addStretch()
         tabs.addTab(scan_tab, "扫描选项")
 
-        # Tab 2: File extensions
+        # ---- Tab 2: File extensions ----
         ext_tab = QWidget()
         ext_layout = QVBoxLayout(ext_tab)
 
+        # Scan all toggle
+        self.scan_all_cb = QCheckBox("扫描所有文件（忽略后缀过滤）")
+        self.scan_all_cb.setChecked(self.scan_all)
+        self.scan_all_cb.toggled.connect(self._on_scan_all_toggled)
+        ext_layout.addWidget(self.scan_all_cb)
+
+        # Quick buttons for big categories
         qa = QHBoxLayout()
-        for txt, fn in [("全选", lambda: self._sel(True)), ("取消全选", lambda: self._sel(False))]:
-            btn = QPushButton(txt)
-            btn.clicked.connect(fn)
+        for name in EXTENSION_CATEGORIES:
+            btn = QPushButton(name)
+            btn.clicked.connect(lambda checked, n=name: self._tgl_big_cat(n))
             qa.addWidget(btn)
+        qa.addStretch()
         ext_layout.addLayout(qa)
 
+        # Scrollable extension tree
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll_content = QWidget()
         scroll_layout = QVBoxLayout(scroll_content)
-        for cat, exts in VIDEO_EXTENSIONS.items():
-            cat_cb = QCheckBox(cat)
-            cat_cb.setChecked(all(e in current_exts for e in exts))
-            cat_cb.toggled.connect(lambda checked, c=cat: self._tgl_cat(c, checked))
-            scroll_layout.addWidget(cat_cb)
 
-            row_layout = QHBoxLayout()
-            for ext in exts:
-                cb = QCheckBox(ext)
-                cb.setChecked(ext in current_exts)
-                self.ext_vars[ext] = cb
-                row_layout.addWidget(cb)
-            scroll_layout.addLayout(row_layout)
+        for big_cat, sub_cats in EXTENSION_CATEGORIES.items():
+            # Big category checkbox
+            big_cb = QCheckBox(big_cat)
+            big_cb.setChecked(False)  # Will be updated below
+            big_cb.toggled.connect(lambda checked, bc=big_cat: self._tgl_big_cat_cb(bc, checked))
+            self.big_cat_vars[big_cat] = big_cb
+            scroll_layout.addWidget(big_cb)
+
+            for sub_cat, exts in sub_cats.items():
+                indent = QWidget()
+                indent_layout = QHBoxLayout(indent)
+                indent_layout.setContentsMargins(20, 0, 0, 0)
+
+                sub_cb = QCheckBox(sub_cat)
+                sub_cb.setChecked(all(e in current_exts for e in exts))
+                sub_cb.toggled.connect(lambda checked, sc=sub_cat: self._tgl_sub_cat(sc, checked))
+                self.cat_vars[sub_cat] = sub_cb
+                indent_layout.addWidget(sub_cb)
+
+                ext_row = QHBoxLayout()
+                for ext in exts:
+                    cb = QCheckBox(ext)
+                    cb.setChecked(ext in (current_exts or set()))
+                    self.ext_vars[ext] = cb
+                    ext_row.addWidget(cb)
+                ext_row.addStretch()
+                indent_layout.addLayout(ext_row)
+                indent_layout.addStretch()
+                scroll_layout.addWidget(indent)
+
+        # Update big category checkbox states
+        for big_cat, sub_cats in EXTENSION_CATEGORIES.items():
+            all_on = True
+            for sub_cat, exts in sub_cats.items():
+                if not all(e in (current_exts or set()) for e in exts):
+                    all_on = False
+                    break
+            self.big_cat_vars[big_cat].setChecked(all_on)
+
         scroll.setWidget(scroll_content)
         ext_layout.addWidget(scroll)
+
+        # Apply scan_all state
+        self._on_scan_all_toggled(self.scan_all)
         tabs.addTab(ext_tab, "文件后缀")
 
         layout.addWidget(tabs)
 
-        # Save
+        # Save / Cancel
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton("取消")
@@ -564,17 +631,73 @@ class SettingsDialog(QWidget):
         btn_row.addWidget(save_btn)
         layout.addLayout(btn_row)
 
-    def _tgl_cat(self, cat, checked):
-        for e in VIDEO_EXTENSIONS.get(cat, []):
-            if e in self.ext_vars:
-                self.ext_vars[e].setChecked(checked)
+    def _on_scan_all_toggled(self, checked):
+        """When 'scan all' is checked, disable extension selection."""
+        self.scan_all = checked
+        for w in self.findChildren(QCheckBox):
+            if w is not self.scan_all_cb and w is not self.full_hash_cb:
+                w.setEnabled(not checked)
+        if checked:
+            # Clear all extension checkboxes
+            for cb in self.ext_vars.values():
+                cb.setChecked(False)
+            for cb in self.cat_vars.values():
+                cb.setChecked(False)
+            for cb in self.big_cat_vars.values():
+                cb.setChecked(False)
 
-    def _sel(self, state):
-        for cb in self.ext_vars.values():
-            cb.setChecked(state)
+    def _tgl_big_cat(self, name):
+        """Toggle all subcategories within a big category."""
+        sub_cats = EXTENSION_CATEGORIES.get(name, {})
+        # Determine if we should check or uncheck
+        any_on = any(
+            any(cb.isChecked() for e, cb in self.ext_vars.items() if e in exts)
+            for exts in sub_cats.values()
+        )
+        for sub_cat, exts in sub_cats.items():
+            self.cat_vars[sub_cat].setChecked(not any_on)
+            for e in exts:
+                if e in self.ext_vars:
+                    self.ext_vars[e].setChecked(not any_on)
+        self._sync_big_cats()
+
+    def _tgl_big_cat_cb(self, big_cat, checked):
+        """Toggle big category via its checkbox."""
+        for sub_cat, exts in EXTENSION_CATEGORIES.get(big_cat, {}).items():
+            self.cat_vars[sub_cat].setChecked(checked)
+            for e in exts:
+                if e in self.ext_vars:
+                    self.ext_vars[e].setChecked(checked)
+
+    def _tgl_sub_cat(self, sub_cat, checked):
+        """Toggle all extensions in a sub-category."""
+        for big_cat, sub_cats in EXTENSION_CATEGORIES.items():
+            exts = sub_cats.get(sub_cat, [])
+            if exts:
+                for e in exts:
+                    if e in self.ext_vars:
+                        self.ext_vars[e].setChecked(checked)
+                cat_cb = self.cat_vars.get(sub_cat)
+                if cat_cb:
+                    cat_cb.setChecked(checked)
+                break
+        self._sync_big_cats()
+
+    def _sync_big_cats(self):
+        """Update big category checkboxes based on sub-category states."""
+        for big_cat, sub_cats in EXTENSION_CATEGORIES.items():
+            all_on = True
+            for sub_cat, exts in sub_cats.items():
+                if not all(self.ext_vars[e].isChecked() for e in exts):
+                    all_on = False
+                    break
+            self.big_cat_vars[big_cat].setChecked(all_on)
 
     def _save(self):
-        self.result_exts = {e for e, cb in self.ext_vars.items() if cb.isChecked()}
+        if self.scan_all:
+            self.result_exts = None  # None = scan all
+        else:
+            self.result_exts = {e for e, cb in self.ext_vars.items() if cb.isChecked()}
         self.result_full_hash = self.full_hash_cb.isChecked()
         self.result_min_size = int(self.min_size_input.text().strip() or "0")
         self.saved = True
@@ -1119,7 +1242,7 @@ class MainWindow(QMainWindow):
         self._prog_target = int(pct * 100)
         self.prog_text.setText(f"{pct:.2f}%  {msg}")
 
-    @Slot(list, int, int)
+    @Slot(list, object, object)
     def _on_scan_done(self, dup_list, total, wasted):
         self.scan_running = False
         self._prog_target = 10000
@@ -1457,44 +1580,29 @@ class MainWindow(QMainWindow):
 
     # ── Settings ──────────────────────────────────────────────────────────
 
-    def _save_min_size(self):
-        """Persist min size and schedule an incremental scan."""
-        try:
-            settings = {}
-            if os.path.exists(SETTINGS_FILE):
-                with open(SETTINGS_FILE, encoding="utf-8") as f:
-                    settings = json.load(f)
-            settings["min_size_mb"] = self.min_size_mb_val
-            settings.setdefault("extensions", sorted(self.active_exts))
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(settings, f, ensure_ascii=False, indent=2)
-        except: pass
-        # Debounced auto-rescan 2s after user stops typing
-        if hasattr(self, '_min_size_timer'):
-            self._min_size_timer.stop()
-        self._min_size_timer = QTimer()
-        self._min_size_timer.setSingleShot(True)
-        self._min_size_timer.timeout.connect(lambda: self._run_scan(False))
-        self._min_size_timer.start(2000)
-
     def _open_settings(self):
-        dlg = SettingsDialog(self.active_exts, self.full_hash_enabled,
-                             self.min_size_mb_val, self)
+        scan_all = self.active_exts is None
+        dlg = SettingsDialog(self.active_exts or set(), self.full_hash_enabled,
+                             self.min_size_mb_val, scan_all, self)
         dlg.show()
         while dlg.isVisible():
             QApplication.processEvents()
         if dlg.saved:
-            self.active_exts = dlg.result_exts
+            self.active_exts = dlg.result_exts  # None = scan all
             self.full_hash_enabled = dlg.result_full_hash
             self.min_size_mb_val = dlg.result_min_size
-            # Persist to settings.json
-            s = {"extensions": sorted(dlg.result_exts),
-                 "full_hash": dlg.result_full_hash,
+            # Persist
+            s = {"full_hash": dlg.result_full_hash,
                  "min_size_mb": dlg.result_min_size}
+            if dlg.result_exts is not None:
+                s["extensions"] = sorted(dlg.result_exts)
+            else:
+                s["scan_all"] = True
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(s, f, ensure_ascii=False, indent=2)
+            count = "全部" if dlg.result_exts is None else len(dlg.result_exts)
             self.sbar.showMessage(
-                f"设置已保存 ({len(dlg.result_exts)} 个后缀, 最小 {dlg.result_min_size} MB)")
+                f"设置已保存 ({count} 个后缀, 最小 {dlg.result_min_size} MB)")
             # Stop current scan (if any) and restart with new settings
             self.scan_running = False
             QTimer.singleShot(300, lambda: self._run_scan(True))
@@ -1520,10 +1628,6 @@ class MainWindow(QMainWindow):
         self.cmp_status.setStyleSheet("color: #f59e0b;")
 
         exts = self.active_exts if self.active_exts else None
-        try:
-            min_mb = self.min_size_mb_val
-        except ValueError:
-            min_mb = 0
 
         def _run():
             try:
@@ -1789,21 +1893,9 @@ class MainWindow(QMainWindow):
                         if len(items) >= 50000:
                             break
 
-                        # Check if folder is empty or only contains empty files
-                        try:
-                            all_files = [os.path.join(root, f) for f in files]
-                            has_content = False
-                            for fp in all_files:
-                                try:
-                                    if os.path.getsize(fp) > 0:
-                                        has_content = True
-                                        break
-                                except OSError:
-                                    pass
-                            if not files and not dirs:
-                                items.append(("空文件夹", root, 0))
-                        except OSError:
-                            pass
+                        # Empty folder (no files and no subdirs)
+                        if not files and not dirs:
+                            items.append(("空文件夹", root, 0))
                 except OSError:
                     pass
 
@@ -1882,14 +1974,12 @@ class MainWindow(QMainWindow):
                     self.prog_bar.setValue(10000)
                     self.prog_text.setText(f"100.00%  扫描完成")
                     self.status_lbl.setText("✓ 已是最新")
-                    self.incr_btn.setEnabled(True)
                     self.refresh_btn.setEnabled(True)
                     self.dup_groups = dup_list
                     self.dup_model.set_groups(dup_list)
                     self._load_data()
                 elif msg[0] == "error":
                     self.prog_text.setText(f"错误: {msg[1]}")
-                    self.incr_btn.setEnabled(True)
                     self.refresh_btn.setEnabled(True)
         except queue.Empty:
             pass
