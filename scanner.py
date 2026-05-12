@@ -20,7 +20,6 @@ def walk_files(paths, extensions=None):
     for base_path in paths:
         base_path = os.path.abspath(os.path.expanduser(base_path))
 
-        # Single file
         if os.path.isfile(base_path):
             try:
                 st = os.stat(base_path)
@@ -30,7 +29,6 @@ def walk_files(paths, extensions=None):
                 pass
             continue
 
-        # Directory: stack-based iterative scan using scandir
         if not os.path.isdir(base_path):
             continue
 
@@ -45,7 +43,6 @@ def walk_files(paths, extensions=None):
                                 if name not in SKIP_DIRS and not name.startswith('.'):
                                     stack.append(entry.path)
                             elif entry.is_file(follow_symlinks=False):
-                                # DirEntry.stat() is free — cache hit from the directory enumeration
                                 st = entry.stat()
                                 if _should_include(entry.path, st.st_size, extensions):
                                     yield entry.path, st.st_size, st.st_mtime_ns
@@ -56,7 +53,6 @@ def walk_files(paths, extensions=None):
 
 
 def _should_include(path, file_size, extensions):
-    """Filter by size, extension, and skip list."""
     if file_size < MIN_FILE_SIZE:
         return False
     _, ext = os.path.splitext(path)
