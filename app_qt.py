@@ -11,13 +11,14 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QCheckBox, QProgressBar,
     QScrollArea,
     QTabWidget, QTableView, QHeaderView, QSplitter, QStatusBar,
+    QTreeView,
     QMenu, QMessageBox, QFileDialog, QAbstractItemView, QStyledItemDelegate,
     QFrame, QSizePolicy,
 )
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, Signal, Slot, QTimer, QThread, QSize,
 )
-from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPalette, QIcon
+from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPalette, QIcon, QStandardItemModel, QStandardItem
 
 from send2trash import send2trash
 
@@ -1101,6 +1102,39 @@ class MainWindow(QMainWindow):
         empty_layout.addWidget(self.empty_table)
 
         self.tabs.addTab(empty_widget, "清理空文件")
+
+        # Tab 6: File tree
+        tree_widget = QWidget()
+        tree_layout = QVBoxLayout(tree_widget)
+        tree_layout.setContentsMargins(4, 4, 4, 4)
+
+        tree_btn_row = QHBoxLayout()
+        self.tree_scan_btn = QPushButton("🔍 扫描盘符")
+        self.tree_scan_btn.clicked.connect(self._start_tree_scan)
+        tree_btn_row.addWidget(self.tree_scan_btn)
+        self.tree_status = QLabel("")
+        self.tree_status.setStyleSheet("color: #6272a4;")
+        tree_btn_row.addWidget(self.tree_status)
+        tree_btn_row.addStretch()
+        tree_layout.addLayout(tree_btn_row)
+
+        self.tree_view = QTreeView()
+        self.tree_view.setAlternatingRowColors(True)
+        self.tree_view.setAnimated(True)
+        self.tree_view.setIndentation(20)
+        self.tree_view.header().setStretchLastSection(False)
+        self.tree_model = QStandardItemModel()
+        self.tree_model.setHorizontalHeaderLabels(["名称", "大小", "文件数"])
+        self.tree_view.setModel(self.tree_model)
+        self.tree_view.setColumnWidth(0, 500)
+        self.tree_view.setColumnWidth(1, 120)
+        self.tree_view.setColumnWidth(2, 80)
+        # Lazy loading: expand triggers population
+        self.tree_view.expanded.connect(self._on_tree_expanded)
+        self.tree_view.clicked.connect(self._on_tree_clicked)
+        tree_layout.addWidget(self.tree_view)
+
+        self.tabs.addTab(tree_widget, "文件树")
         main_layout.addWidget(self.tabs)
 
         # ── Status bar ──
@@ -1988,6 +2022,108 @@ class MainWindow(QMainWindow):
                     self.refresh_btn.setEnabled(True)
         except queue.Empty:
             pass
+
+
+    # ── File Tree ──────────────────────────────────────────────────────────
+
+    def _start_tree_scan(self):
+        """Populate root level with selected drives (immediate sizes only)."""
+        self.tree_model.removeRows(0, self.tree_model.rowCount())
+        self.tree_scan_btn.setEnabled(False)
+        self.tree_status.setText("● 扫描中...")
+        self.tree_status.setStyleSheet("color: #f59e0b;")
+
+        drives = {d for d, cb in self.drive_checks.items() if cb.isChecked()}
+        if not drives:
+            drives = {d for d, cb in self.drive_checks.items()}
+
+        import shutil
+        for d in sorted(drives):
+            path = f"{d}:\\"
+            try:
+                usage = shutil.disk_usage(path)
+                total_str = format_size(usage.total)
+            except Exception:
+                total_str = "..."
+            root = QStandardItem(f"{d}:  ({total_str})")
+            root.setData(path, Qt.UserRole)
+            root.setData(True, Qt.UserRole + 1)  # needs loading
+            sz = QStandardItem(total_str)
+            sz.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            cnt = QStandardItem("")
+            self.tree_model.appendRow([root, sz, cnt])
+            root.appendRow([QStandardItem("..."), QStandardItem(""), QStandardItem("")])
+
+        self.tree_status.setText("✓ 点击展开查看子目录")
+        self.tree_status.setStyleSheet("color: #22c55e;")
+        self.tree_scan_btn.setEnabled(True)
+
+    def _on_tree_expanded(self, index):
+        """Lazy load children with recursive sizes when a node is expanded."""
+        item = self.tree_model.itemFromIndex(index)
+        if not item or not item.data(Qt.UserRole + 1):
+            return
+        item.setData(False, Qt.UserRole + 1)
+        item.removeRows(0, item.rowCount())
+        path = item.data(Qt.UserRole)
+        if not path: return
+
+        def _run():
+            children = []
+            try:
+                for entry in os.scandir(path):
+                    try:
+                        if entry.is_dir() and not entry.name.startswith('.') and entry.name not in {
+                                "$RECYCLE.BIN", "System Volume Information", "Windows",
+                                "Program Files", "Program Files (x86)", "ProgramData", "Recovery"}:
+                            full = entry.path
+                            size = _get_dir_size_recursive(full)
+                            size_str = format_size(size) if size > 0 else "0 B"
+                            children.append((entry.name, full, size, size_str))
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+
+            children.sort(key=lambda x: x[2], reverse=True)
+            for name, full, size, size_str in children:
+                child = QStandardItem(name)
+                child.setData(full, Qt.UserRole)
+                child.setData(True, Qt.UserRole + 1)
+                sz = QStandardItem(size_str)
+                sz.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                cnt = QStandardItem("")
+                child.appendRow([QStandardItem("..."), QStandardItem(""), QStandardItem("")])
+                item.appendRow([child, sz, cnt])
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_tree_clicked(self, index):
+        """Click on a node with placeholder data triggers expand/lazy load."""
+        item = self.tree_model.itemFromIndex(index)
+        if item and item.data(Qt.UserRole + 1):
+            self.tree_view.expand(index)
+
+
+def _get_dir_size_recursive(path, depth=0):
+    """Recursive size calculation with depth limit."""
+    if depth > 20:
+        return 0
+    total = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file():
+                        total += entry.stat().st_size
+                    elif entry.is_dir() and not entry.name.startswith('.') and entry.name not in {
+                            "$RECYCLE.BIN", "System Volume Information", "Windows"}:
+                        total += _get_dir_size_recursive(entry.path, depth + 1)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
 
 
 def _reveal_in_explorer(path):
