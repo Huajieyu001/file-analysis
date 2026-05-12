@@ -744,7 +744,7 @@ class MainWindow(QMainWindow):
         self.scan_worker = None
 
         self._build_ui()
-        self._load_data()
+        # Don't load old DB data — wait for fresh scan to complete
         self._start_auto_scan()
 
         # Poll progress

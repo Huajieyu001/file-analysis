@@ -34,13 +34,12 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
     """
     t0 = time.time()
 
-    # Force mode: mark all existing as missing first, then let the scan re-discover them
-    # This ensures files deleted from disk are properly cleaned out
+    # Force mode: delete ALL records, then scan re-adds only what's on disk
     if force:
-        db.conn.execute("UPDATE file_index SET status='missing' WHERE status != 'missing'")
+        db.conn.execute("DELETE FROM file_index")
         db.conn.commit()
 
-    # Always load existing paths to detect deleted files
+    # Load existing paths (empty if force mode just deleted everything)
     existing = db.existing_paths_map()
 
     # ---- Pass 1: Walk and record file sizes ----
