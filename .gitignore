@@ -12,5 +12,11 @@ settings.json
 __pycache__/
 *.pyc
 
+# Build artifacts
+build/
+dist/
+*.spec
+*.sln
+
 # IDE / Claude
 .claude/
