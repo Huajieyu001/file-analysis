@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, Signal, Slot, QTimer, QThread, QSize,
 )
-from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPalette, QIcon, QStandardItemModel, QStandardItem
+from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPalette, QIcon, QStandardItemModel, QStandardItem, QCloseEvent
+from PySide6.QtWidgets import QSystemTrayIcon
 
 from send2trash import send2trash
 
@@ -728,12 +729,14 @@ class MainWindow(QMainWindow):
         # Load saved scan options
         self.full_hash_enabled = False
         self.min_size_mb_val = MIN_FILE_SIZE_MB
+        self._close_action = ''
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, encoding="utf-8") as f:
                     s = json.load(f)
                     self.full_hash_enabled = s.get("full_hash", False)
                     self.min_size_mb_val = s.get("min_size_mb", MIN_FILE_SIZE_MB)
+                    self._close_action = s.get("close_action", '')
             except: pass
 
         self.db = Database()
@@ -744,6 +747,8 @@ class MainWindow(QMainWindow):
         self.scan_worker = None
 
         self._build_ui()
+        # System tray
+        self._setup_tray()
         # Don't load old DB data — wait for fresh scan to complete
         self._start_auto_scan()
 
@@ -1630,9 +1635,13 @@ class MainWindow(QMainWindow):
             self.active_exts = dlg.result_exts  # None = scan all
             self.full_hash_enabled = dlg.result_full_hash
             self.min_size_mb_val = dlg.result_min_size
-            # Persist
-            s = {"full_hash": dlg.result_full_hash,
-                 "min_size_mb": dlg.result_min_size}
+            # Persist — load old to preserve close_action etc.
+            s = {}
+            if os.path.exists(SETTINGS_FILE):
+                try: s = json.load(open(SETTINGS_FILE, encoding="utf-8"))
+                except: pass
+            s["full_hash"] = dlg.result_full_hash
+            s["min_size_mb"] = dlg.result_min_size
             if dlg.result_exts is not None:
                 s["extensions"] = sorted(dlg.result_exts)
             else:
@@ -1996,6 +2005,79 @@ class MainWindow(QMainWindow):
         # Don't clear list so user can see what was done; they can re-scan
 
     # ── Clean ─────────────────────────────────────────────────────────────
+
+    # ── System Tray ────────────────────────────────────────────────────────
+
+    def _setup_tray(self):
+        """Create system tray icon with context menu."""
+        self.tray_icon = QSystemTrayIcon(self)
+        icon_path = _resource_path("app_icon.ico")
+        if os.path.exists(icon_path):
+            self.tray_icon.setIcon(QIcon(icon_path))
+        self.tray_icon.setToolTip("CleanDup")
+
+        menu = QMenu()
+        menu.addAction("📂 显示窗口", self._tray_show)
+        menu.addAction("⟳ 全量刷新", lambda: self._run_scan(True))
+        menu.addSeparator()
+        menu.addAction("❌ 退出", self._tray_exit)
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        """Double-click tray icon to restore window."""
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._tray_show()
+
+    def _tray_show(self):
+        """Restore window from tray."""
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+    def _tray_exit(self):
+        """Fully exit the application."""
+        self.tray_icon.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event: QCloseEvent):
+        """Show dialog or use saved preference for close behavior."""
+        saved = getattr(self, '_close_action', '')
+        if saved == 'tray':
+            self.hide(); event.ignore(); return
+        if saved == 'quit':
+            self.tray_icon.hide(); event.accept(); return
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("CleanDup")
+        msg.setText("请选择操作")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+        msg.button(QMessageBox.Yes).setText("最小化到托盘")
+        msg.button(QMessageBox.No).setText("直接关闭")
+        msg.button(QMessageBox.Cancel).setText("取消")
+        cb = QCheckBox("记住我的选择，下次不再询问")
+        msg.setCheckBox(cb)
+        reply = msg.exec()
+
+        if reply == QMessageBox.Yes:
+            self.hide(); event.ignore()
+            action = 'tray'
+        elif reply == QMessageBox.No:
+            self.tray_icon.hide(); event.accept()
+            action = 'quit'
+        else:
+            event.ignore(); return
+
+        if cb.isChecked():
+            self._close_action = action
+            s = {}
+            if os.path.exists(SETTINGS_FILE):
+                try: s = json.load(open(SETTINGS_FILE, encoding="utf-8"))
+                except: pass
+            s["close_action"] = action
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(s, f, ensure_ascii=False, indent=2)
 
     # ── Progress polling ─────────────────────────────────────────────────
 
