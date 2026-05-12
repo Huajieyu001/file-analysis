@@ -1436,14 +1436,12 @@ class MainWindow(QMainWindow):
             _reveal_in_explorer(self.dup_model._groups[row][2][0][0])
 
     def _on_detail_checkbox_clicked(self, index):
-        """Toggle checkbox for column 0 clicks."""
-        if index.column() != 0:
-            return
-        # Toggle the checked state
+        """Clicking any column on a detail row toggles its checkbox."""
         fp, fs, mt, checked = self.detail_model._files[index.row()]
         new_state = not checked
         self.detail_model._files[index.row()] = (fp, fs, mt, new_state)
         self.detail_model.dataChanged.emit(index, index, [Qt.CheckStateRole])
+        self._update_toggle_btn()
 
     def _detail_context_menu(self, pos):
         """Right-click menu for files in detail view (supports multi-select)."""
