@@ -315,6 +315,7 @@ class FileDetailModel(QAbstractTableModel):
 class ScanWorker(QThread):
     progress = Signal(str, str)   # stage, message
     finished = Signal(list, object, object)  # dup_list, total_files, wasted_bytes (object for large ints)
+    cancelled = Signal()
     error = Signal(str)
 
     def __init__(self, drives, force, extensions, fast_mode, min_mb):
@@ -324,12 +325,19 @@ class ScanWorker(QThread):
         self.extensions = extensions
         self.fast_mode = fast_mode
         self.min_mb = min_mb
+        self._cancel_event = None
+
+    def cancel(self):
+        if self._cancel_event:
+            self._cancel_event.set()
 
     def run(self):
         try:
+            import threading
             import scanner
             scanner.MIN_FILE_SIZE = max(1, self.min_mb * MB)
 
+            self._cancel_event = threading.Event()
             db = Database()
             db.init_db()
 
@@ -339,7 +347,12 @@ class ScanWorker(QThread):
             self.progress.emit("scan_start", "开始扫描...")
             groups = run_dedup(self.drives, db, force=self.force,
                 progress_callback=on_progress, extensions=self.extensions,
-                fast_mode=self.fast_mode)
+                fast_mode=self.fast_mode, cancel_event=self._cancel_event)
+
+            if self._cancel_event.is_set():
+                db.close()
+                self.cancelled.emit()
+                return
 
             dup_list = []
             for fhash, fsize, files in groups:
@@ -1314,7 +1327,20 @@ class MainWindow(QMainWindow):
             self._run_scan(True)
 
     def _run_scan(self, force):
-        if self.scan_running: return
+        if self.scan_running:
+            # Already scanning — cancel old worker before starting new one
+            if self.scan_worker and self.scan_worker.isRunning():
+                self.scan_worker.cancel()
+                # Disconnect old signals so they don't fire after new scan starts
+                try:
+                    self.scan_worker.progress.disconnect()
+                    self.scan_worker.finished.disconnect()
+                    self.scan_worker.cancelled.disconnect()
+                    self.scan_worker.error.disconnect()
+                except Exception:
+                    pass
+                self.scan_worker.wait(3000)
+            self.scan_running = False
         drives = [f"{d}:\\" for d, cb in self.drive_checks.items() if cb.isChecked()]
         if not drives:
             QTimer.singleShot(500, lambda: self._run_scan(force))
@@ -1327,7 +1353,11 @@ class MainWindow(QMainWindow):
         self.search_model.set_data([])
         self.status_lbl.setText("● 扫描中...")
         self.status_lbl.setStyleSheet("color: #f59e0b; font-weight: bold;")
-        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText("■ 停止扫描")
+        self.refresh_btn.setStyleSheet("color: #ff5555;")
+        self.refresh_btn.clicked.disconnect()
+        self.refresh_btn.clicked.connect(self._on_stop_scan)
+        self.refresh_btn.setEnabled(True)
         self._prog_target = 0
         self._prog_current = 0
         self.prog_bar.setValue(0)
@@ -1339,8 +1369,16 @@ class MainWindow(QMainWindow):
                                       not self.full_hash_enabled, min_mb)
         self.scan_worker.progress.connect(self._on_scan_progress)
         self.scan_worker.finished.connect(self._on_scan_done)
+        self.scan_worker.cancelled.connect(self._on_scan_cancelled)
         self.scan_worker.error.connect(self._on_scan_error)
         self.scan_worker.start()
+
+    def _on_stop_scan(self):
+        if self.scan_worker and self.scan_worker.isRunning():
+            self.scan_worker.cancel()
+            self.status_lbl.setText("● 正在停止...")
+            self.status_lbl.setStyleSheet("color: #f59e0b; font-weight: bold;")
+            self.refresh_btn.setEnabled(False)
 
     @Slot(str, str)
     def _on_scan_progress(self, stage, msg):
@@ -1350,6 +1388,13 @@ class MainWindow(QMainWindow):
             pct = self._calc_pct(stage, msg)
             self._prog_target = int(pct * 100)
             self.prog_text.setText(f"{pct:.2f}%  {msg}")
+
+    def _restore_refresh_btn(self):
+        self.refresh_btn.clicked.disconnect()
+        self.refresh_btn.setText("⟳ 全量刷新")
+        self.refresh_btn.setStyleSheet("")
+        self.refresh_btn.clicked.connect(self._on_refresh_clicked)
+        self.refresh_btn.setEnabled(True)
 
     @Slot(list, object, object)
     def _on_scan_done(self, dup_list, total, wasted):
@@ -1368,11 +1413,19 @@ class MainWindow(QMainWindow):
         self.prog_text.setText(f"100.00%  扫描完成  ·  {stats['total_files']:,} 文件  ·  {db_groups:,} 组重复  ·  可释放 {db_wasted}{timing_text}")
         self.status_lbl.setText("✓ 已是最新")
         self.status_lbl.setStyleSheet("color: #22c55e; font-weight: bold;")
-        self.refresh_btn.setEnabled(True)
+        self._restore_refresh_btn()
         self.dup_groups = dup_list
         self.dup_model.set_groups(dup_list)
         self._update_drive_capacity()
         self._load_data()
+
+    @Slot()
+    def _on_scan_cancelled(self):
+        self.scan_running = False
+        self.prog_text.setText("扫描已停止")
+        self.status_lbl.setText("■ 已停止 (可点击全量刷新重新扫描)")
+        self.status_lbl.setStyleSheet("color: #f59e0b; font-weight: bold;")
+        self._restore_refresh_btn()
 
     @Slot(str)
     def _on_scan_error(self, err):
@@ -1380,7 +1433,7 @@ class MainWindow(QMainWindow):
         self.prog_text.setText(f"错误: {err}")
         self.status_lbl.setText("✗ 扫描出错")
         self.status_lbl.setStyleSheet("color: #ff5555; font-weight: bold;")
-        self.refresh_btn.setEnabled(True)
+        self._restore_refresh_btn()
 
     def _animate_progress(self):
         """Smoothly animate progress bar toward target."""
@@ -1718,8 +1771,7 @@ class MainWindow(QMainWindow):
             count = "全部" if dlg.result_exts is None else len(dlg.result_exts)
             self.sbar.showMessage(
                 f"设置已保存 ({count} 个后缀, 最小 {dlg.result_min_size} MB)")
-            # Stop current scan (if any) and restart with new settings
-            self.scan_running = False
+            # Restart scan with new settings
             QTimer.singleShot(300, lambda: self._run_scan(True))
 
     # ── Export ────────────────────────────────────────────────────────────

@@ -25,12 +25,14 @@ from config import WORKER_THREADS
 PASS1_BATCH = 2000
 
 
-def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, fast_mode=False):
+def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, fast_mode=False, cancel_event=None):
     """Main dedup orchestration.
 
     Pass 1: Walk files, record size/mtime. Skip unchanged files (unless force=True).
     Pass 2: For same-size groups, compute quick_hash in parallel.
     Pass 3: For same quick_hash groups, compute full_hash (skipped in fast_mode).
+
+    cancel_event: threading.Event — set to True to abort early.
     """
     t0 = time.time()
 
@@ -67,12 +69,16 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
 
         batch.append((file_path, file_size, mtime_ns))
         if len(batch) >= PASS1_BATCH:
+            if cancel_event and cancel_event.is_set():
+                return []
             _flush_pass1(batch, db)
             new_count += len(batch)
             batch.clear()
             if progress_callback:
                 progress_callback("pass1_progress", f"Scanned {new_count + skipped_count} files...")
 
+    if cancel_event and cancel_event.is_set():
+        return []
     if batch:
         _flush_pass1(batch, db)
         new_count += len(batch)
@@ -90,6 +96,8 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
         )
 
     # ---- Pass 2: Quick hash for same-size groups ----
+    if cancel_event and cancel_event.is_set():
+        return []
     pass2_start = time.time()
     if progress_callback:
         progress_callback("pass2_start", "Computing quick hashes...")
@@ -111,6 +119,7 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
             progress_callback=progress_callback,
             pass_label="pass2",
             progress_interval=500,
+            cancel_event=cancel_event,
         )
         db.conn.commit()
         try:
@@ -134,6 +143,8 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
         )
 
     # ---- Pass 3: Full hash (skipped in fast_mode) ----
+    if cancel_event and cancel_event.is_set():
+        return []
     if fast_mode:
         # Use quick_hash as final hash: same (qhash, size) => duplicate
         if progress_callback:
@@ -169,6 +180,7 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
                 progress_callback=progress_callback,
                 pass_label="pass3",
                 progress_interval=50,
+                cancel_event=cancel_event,
             )
             db.conn.commit()
             try:
@@ -213,6 +225,7 @@ def _parallel_hash(
     progress_callback=None,
     pass_label="",
     progress_interval=500,
+    cancel_event=None,
 ):
     """Process a list of files with a hash function in parallel."""
     total = len(file_list)
@@ -225,6 +238,9 @@ def _parallel_hash(
         }
 
         for future in as_completed(futures):
+            if cancel_event and cancel_event.is_set():
+                executor.shutdown(wait=False, cancel_futures=True)
+                return
             file_path, file_size = futures[future]
             done += 1
             try:
