@@ -510,6 +510,75 @@ class EmptyFilesModel(QAbstractTableModel):
         return len(self._checked)
 
 
+# ─── Extension Statistics ─────────────────────────────────────────────────────
+
+class ExtStatsModel(QAbstractTableModel):
+    """Model for per-extension file counts (no size/hash, just counting)."""
+    def __init__(self):
+        super().__init__()
+        self._rows = []  # [(ext, count), ...]
+        self._headers = ["后缀", "文件数"]
+
+    def rowCount(self, parent=QModelIndex()): return len(self._rows)
+    def columnCount(self, parent=QModelIndex()): return 2
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid(): return None
+        r, c = index.row(), index.column()
+        ext, count = self._rows[r]
+        if role == Qt.DisplayRole:
+            if c == 0: return ext or "(无后缀)"
+            if c == 1: return f"{count:,}"
+        if role == Qt.ForegroundRole:
+            return QColor("#c0c5d4")
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self._headers[section]
+        return None
+
+    def set_rows(self, rows):
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+
+# ─── Disk Analysis ───────────────────────────────────────────────────────────
+
+class DiskAnalysisModel(QAbstractTableModel):
+    """Model for per-extension-type file counts and sizes."""
+    def __init__(self):
+        super().__init__()
+        self._rows = []  # [(category, file_count, total_size), ...]
+        self._headers = ["类别", "文件数", "总大小"]
+
+    def rowCount(self, parent=QModelIndex()): return len(self._rows)
+    def columnCount(self, parent=QModelIndex()): return 3
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid(): return None
+        r, c = index.row(), index.column()
+        cat, count, size = self._rows[r]
+        if role == Qt.DisplayRole:
+            if c == 0: return cat
+            if c == 1: return f"{count:,}"
+            if c == 2: return format_size(size)
+        if role == Qt.ForegroundRole:
+            return QColor("#c0c5d4")
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self._headers[section]
+        return None
+
+    def set_rows(self, rows):
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+
 # ─── Settings Dialog ─────────────────────────────────────────────────────────
 
 class SettingsDialog(QWidget):
@@ -1140,6 +1209,70 @@ class MainWindow(QMainWindow):
         tree_layout.addWidget(self.tree_view)
 
         self.tabs.addTab(tree_widget, "文件树")
+
+        # Tab 7: Disk analysis
+        disk_widget = QWidget()
+        disk_layout = QVBoxLayout(disk_widget)
+        disk_layout.setContentsMargins(8, 8, 8, 8)
+
+        disk_btn_row = QHBoxLayout()
+        self.disk_scan_btn = QPushButton("🔍 分析盘符")
+        self.disk_scan_btn.clicked.connect(self._start_disk_analysis)
+        disk_btn_row.addWidget(self.disk_scan_btn)
+        self.disk_status = QLabel("")
+        self.disk_status.setStyleSheet("color: #6272a4;")
+        disk_btn_row.addWidget(self.disk_status)
+        disk_btn_row.addStretch()
+        disk_layout.addLayout(disk_btn_row)
+
+        # Summary cards area
+        self.disk_summary = QHBoxLayout()
+        disk_layout.addLayout(self.disk_summary)
+
+        # Detail table
+        self.disk_table = QTableView()
+        self.disk_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.disk_table.horizontalHeader().setStretchLastSection(True)
+        self.disk_table.verticalHeader().setVisible(False)
+        self.disk_table.setShowGrid(False)
+        self.disk_table.setAlternatingRowColors(True)
+        self.disk_model = DiskAnalysisModel()
+        self.disk_table.setModel(self.disk_model)
+        self.disk_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        disk_layout.addWidget(self.disk_table)
+
+        self.tabs.addTab(disk_widget, "盘符分析")
+
+        # Tab 8: Extension statistics
+        ext_stats_widget = QWidget()
+        ext_layout = QVBoxLayout(ext_stats_widget)
+        ext_layout.setContentsMargins(8, 8, 8, 8)
+
+        ext_btn_row = QHBoxLayout()
+        self.ext_stats_btn = QPushButton("🔍 统计后缀")
+        self.ext_stats_btn.clicked.connect(self._start_ext_stats)
+        ext_btn_row.addWidget(self.ext_stats_btn)
+        self.ext_stats_status = QLabel("")
+        self.ext_stats_status.setStyleSheet("color: #6272a4;")
+        ext_btn_row.addWidget(self.ext_stats_status)
+        ext_btn_row.addStretch()
+        ext_layout.addLayout(ext_btn_row)
+
+        self.ext_stats_table = QTableView()
+        self.ext_stats_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.ext_stats_table.setSortingEnabled(True)
+        self.ext_stats_table.horizontalHeader().setStretchLastSection(True)
+        self.ext_stats_table.verticalHeader().setVisible(False)
+        self.ext_stats_table.setShowGrid(False)
+        self.ext_stats_table.setAlternatingRowColors(True)
+        self.ext_stats_model = ExtStatsModel()
+        self.ext_stats_table.setModel(self.ext_stats_model)
+        self.ext_stats_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        # Default sort by count desc
+        self.ext_stats_table.sortByColumn(1, Qt.DescendingOrder)
+        ext_layout.addWidget(self.ext_stats_table)
+
+        self.tabs.addTab(ext_stats_widget, "后缀统计")
         main_layout.addWidget(self.tabs)
 
         # ── Status bar ──
@@ -2106,7 +2239,123 @@ class MainWindow(QMainWindow):
             pass
 
 
-    # ── File Tree ──────────────────────────────────────────────────────────
+    # ── Disk Analysis ──────────────────────────────────────────────────────
+
+    def _start_disk_analysis(self):
+        """Scan selected drives and categorize files by extension type."""
+        drives = [f"{d}:\\" for d, cb in self.drive_checks.items() if cb.isChecked()]
+        if not drives:
+            drives = [f"{d}:\\" for d in self.drive_checks]
+
+        self.disk_scan_btn.setEnabled(False)
+        self.disk_status.setText("● 分析中...")
+        self.disk_status.setStyleSheet("color: #f59e0b;")
+
+        # Build extension -> category map
+        ext_to_cat = {}
+        cat_names = list(EXTENSION_CATEGORIES.keys())
+        for cat_name in cat_names:
+            for sub_cat, exts in EXTENSION_CATEGORIES[cat_name].items():
+                for e in exts:
+                    ext_to_cat[e] = cat_name
+
+        def _run():
+            # Counts per category: {cat: [count, total_size]}
+            cats = {name: [0, 0] for name in cat_names}
+            cats["其它"] = [0, 0]
+            total_files = 0
+            total_size = 0
+
+            for drive in drives:
+                try:
+                    for root, dirs, files in os.walk(drive):
+                        dirs[:] = [d for d in dirs if not d.startswith('.')
+                                   and d not in {"$RECYCLE.BIN", "System Volume Information",
+                                                  "Windows", "Program Files", "Program Files (x86)",
+                                                  "ProgramData", "Recovery", ".git", "__pycache__"}]
+                        for fname in files:
+                            try:
+                                fp = os.path.join(root, fname)
+                                st = os.stat(fp)
+                                ext = os.path.splitext(fname)[1].lower()
+                                cat = ext_to_cat.get(ext, "其它")
+                                cats[cat][0] += 1
+                                cats[cat][1] += st.st_size
+                                total_files += 1
+                                total_size += st.st_size
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+
+            # Build sorted rows: known categories first (by count desc), then "其它"
+            rows = []
+            for cat in cat_names:
+                if cats[cat][0] > 0:
+                    rows.append((cat, cats[cat][0], cats[cat][1]))
+            rows.sort(key=lambda x: x[1], reverse=True)
+            if cats["其它"][0] > 0:
+                rows.append(("其它", cats["其它"][0], cats["其它"][1]))
+
+            self.disk_model.set_rows(rows)
+            self.disk_status.setText(
+                f"✓ {total_files:,} 个文件  |  总大小 {format_size(total_size)}")
+            self.disk_status.setStyleSheet("color: #22c55e;")
+            self.disk_scan_btn.setEnabled(True)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_disk_analysis_clicked(self, index):
+        """Show per-extension breakdown for a category."""
+        data = self.disk_model.data(index, Qt.UserRole)
+        if not data or not isinstance(data, dict):
+            return
+        lines = []
+        for ext, (cnt, sz) in data.items():
+            lines.append(f"{ext:<12} {cnt:>8,} 个  {format_size(sz):>12}")
+        text = "后缀明细\n" + "-" * 50 + "\n" + "\n".join(lines)
+        QMessageBox.information(self, "后缀统计", text)
+
+    # ── Extension Stats ───────────────────────────────────────────────────
+
+    def _start_ext_stats(self):
+        """Count files by extension across selected drives (no hash, no size calc)."""
+        drives = [f"{d}:\\" for d, cb in self.drive_checks.items() if cb.isChecked()]
+        if not drives:
+            drives = [f"{d}:\\" for d in self.drive_checks]
+
+        self.ext_stats_btn.setEnabled(False)
+        self.ext_stats_status.setText("● 统计中...")
+        self.ext_stats_status.setStyleSheet("color: #f59e0b;")
+
+        exts_filter = self.active_exts if self.active_exts and self.active_exts else None
+
+        def _run():
+            counts = {}
+            total = 0
+            for drive in drives:
+                try:
+                    for root, dirs, files in os.walk(drive):
+                        dirs[:] = [d for d in dirs if not d.startswith('.')
+                                   and d not in {"$RECYCLE.BIN", "System Volume Information",
+                                                  "Windows", "Program Files", "Program Files (x86)",
+                                                  "ProgramData", "Recovery", ".git", "__pycache__"}]
+                        for fname in files:
+                            ext = os.path.splitext(fname)[1].lower()
+                            if exts_filter and ext not in exts_filter:
+                                continue
+                            counts[ext] = counts.get(ext, 0) + 1
+                            total += 1
+                except OSError:
+                    pass
+
+            rows = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+            self.ext_stats_model.set_rows(rows)
+            self.ext_stats_status.setText(f"✓ {total:,} 个文件  |  {len(rows)} 种后缀")
+            self.ext_stats_status.setStyleSheet("color: #22c55e;")
+            self.ext_stats_btn.setEnabled(True)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _start_tree_scan(self):
         """Populate root level with selected drives (immediate sizes only)."""
