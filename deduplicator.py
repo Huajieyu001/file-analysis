@@ -4,13 +4,12 @@
 三段式逐步求精策略，逐层过滤缩小候选集：
 
   Pass 1 — 按文件大小分组，大小唯一的文件直接排除(覆盖绝大多数)
-  Pass 2 — 同大小文件计算 quick_hash(首尾各64KB)，quick_hash 唯一的排除
-  Pass 3 — 同 quick_hash 文件计算 full_hash(完整文件)，确认最终重复
+  Pass 2 — 同大小文件(>2MB)计算 quick_hash(首尾各8KB)，quick_hash 唯一的排除；
+           ≤2MB 文件直接推迟到 Pass 3 做完整哈希
+  Pass 3 — 同 quick_hash 文件 + 所有≤2MB 小文件计算 full_hash(完整文件)，确认最终重复
 
-快速模式(fast_mode=True)跳过 Pass 3，直接用 quick_hash 判定重复，
-牺牲极小精度换取数量级的扫描速度提升。
-
-所有哈希计算使用 ThreadPoolExecutor 并行执行，I/O 密集型任务收益显著。
+快速模式(fast_mode=True)将大文件的 quick_hash 直接作为最终哈希，
+小文件仍然计算 full_hash（小文件 I/O 开销低）。
 """
 
 import sys
@@ -19,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from scanner import walk_files
 from hasher import quick_hash, full_hash
-from config import WORKER_THREADS
+from config import WORKER_THREADS, SMALL_FILE_THRESHOLD
 
 # Pass 1 批量写入 DB 的记录数
 PASS1_BATCH = 2000
@@ -95,7 +94,7 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
             f"{len(missing_set)} removed ({pass1_time:.1f}s)",
         )
 
-    # ---- Pass 2: Quick hash for same-size groups ----
+    # ---- Pass 2: Quick hash for same-size groups (>SMALL_FILE_THRESHOLD only) ----
     if cancel_event and cancel_event.is_set():
         return []
     pass2_start = time.time()
@@ -103,10 +102,14 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
         progress_callback("pass2_start", "Computing quick hashes...")
 
     size_groups = db.get_size_groups(min_group_size=2)
-    qhash_queue = []
+    small_files = []   # ≤2MB: skip quick hash, go straight to full hash
+    qhash_queue = []   # >2MB: compute quick hash (head+tail)
     for file_size, _ in size_groups:
         files = db.get_files_by_size(file_size)
-        qhash_queue.extend(files)
+        if file_size <= SMALL_FILE_THRESHOLD:
+            small_files.extend(files)
+        else:
+            qhash_queue.extend(files)
 
     if qhash_queue:
         _parallel_hash(
@@ -139,16 +142,24 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
         progress_callback(
             "pass2_done",
             f"Pass 2 done: {len(qhash_queue)} files quick-hashed, "
+            f"{len(small_files)} small files deferred, "
             f"{len(qhash_groups)} groups need full hash",
         )
 
-    # ---- Pass 3: Full hash (skipped in fast_mode) ----
+    # ---- Pass 3: Full hash (small files always get full hash) ----
     if cancel_event and cancel_event.is_set():
         return []
+
+    # Build full_queue: qhash collisions + small files (which bypassed quick hash)
+    full_queue = list(small_files)
+    for quick_hash_val, file_size, _ in qhash_groups:
+        files = db.get_files_by_qhash_and_size(quick_hash_val, file_size)
+        full_queue.extend(files)
+
     if fast_mode:
-        # Use quick_hash as final hash: same (qhash, size) => duplicate
+        # Large files: use quick_hash as final; small files: compute full_hash
         if progress_callback:
-            progress_callback("pass3_start", "Fast mode: using quick hash as final, skipping full hash...")
+            progress_callback("pass3_start", "Fast mode: small files full-hash, large files via quick hash...")
         now = int(time.time())
         for qh, fsz, _ in qhash_groups:
             db.conn.execute(
@@ -157,17 +168,32 @@ def run_dedup(paths, db, force=False, progress_callback=None, extensions=None, f
                 (qh, now, qh, fsz),
             )
         db.conn.commit()
+        # Only compute full_hash for small files
+        if full_queue:
+            _parallel_hash(
+                full_queue,
+                db,
+                hash_func=full_hash,
+                update_func=db.update_full_hash,
+                skip_func=db.update_skipped,
+                description="full hash (small files)",
+                progress_callback=progress_callback,
+                pass_label="pass3",
+                progress_interval=50,
+                cancel_event=cancel_event,
+            )
+            db.conn.commit()
+            try:
+                db.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except Exception:
+                pass
         if progress_callback:
             progress_callback("pass3_done",
-                f"Fast mode: {len(qhash_groups)} duplicate groups confirmed via quick hash")
+                f"Fast mode: {len(qhash_groups)} groups via quick hash, "
+                f"{len(full_queue)} small files full-hashed")
     else:
         if progress_callback:
             progress_callback("pass3_start", "Computing full hashes...")
-
-        full_queue = []
-        for quick_hash_val, file_size, _ in qhash_groups:
-            files = db.get_files_by_qhash_and_size(quick_hash_val, file_size)
-            full_queue.extend(files)
 
         if full_queue:
             _parallel_hash(

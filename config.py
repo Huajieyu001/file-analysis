@@ -21,10 +21,11 @@ def _get_db_path():
 DB_PATH = _get_db_path()
 
 # ---- 哈希计算 ----
-# 快速哈希：仅读取文件头 8KB，已足够区分不同来源的视频文件
-# 视频容器头包含编码器、分辨率、时长等元数据，同大小+同头8KB碰撞概率极低
+# 快速哈希：文件头+尾各 8KB，仅用于 >2MB 的文件
+# ≤2MB 的文件跳过快速哈希，直接计算完整哈希（小文件 I/O 开销低）
 QUICK_HASH_HEAD_BYTES = 8 * 1024    # 文件头读取量
-QUICK_HASH_TAIL_BYTES = 0           # 不再读尾部，省去 HDD 的 seek 操作
+QUICK_HASH_TAIL_BYTES = 8 * 1024    # 文件尾读取量
+SMALL_FILE_THRESHOLD = 2 * 1024 * 1024  # 快速哈希阈值：≤2MB 的文件跳过 Pass 2
 # 完整哈希：流式读取时的缓冲区大小
 HASH_READ_CHUNK = 1024 * 1024       # 1MB 块
 
